@@ -3,25 +3,60 @@ import { VectorIndexer } from "./indexer";
 import type LatticePlugin from "./main";
 import type {
 	OKFFrontmatter,
-	OKFStatus,
 	OKFType,
 	ScoredVectorRecord,
 	VectorRecord,
 } from "./settings";
 
 export const VALID_OKF_TYPES: OKFType[] = [
-	"Concept",
-	"Spec",
-	"Playbook",
-	"Reference",
-	"Seed",
+	"note",
+	"paper",
+	"topic",
+	"project",
 ];
 
-export const VALID_OKF_STATUSES: OKFStatus[] = [
+export const SOURCE_TYPE_ALIASES = new Set([
+	"paper",
+	"source",
+	"book",
+	"web",
+	"transcript",
+	"email",
+	"dataset",
+	"reference",
+]);
+
+export const NOTE_TYPE_ALIASES = new Set([
+	"note",
+	"spec",
+	"concept",
 	"seed",
-	"growing",
-	"evergreen",
-];
+	"playbook",
+	"journal",
+]);
+
+export const HUB_OKF_TYPES = new Set([
+	"topic",
+	"project",
+]);
+
+export const OKF_TYPE_FOLDER_MAP: Record<string, string> = {
+	note: "notes",
+	paper: "sources/literature",
+	topic: "topics",
+	project: "projects",
+};
+
+export const ISO_TIMESTAMP_REGEX =
+	/^\d{4}-\d{2}-\d{2}([T ]\d{2}:\d{2}(:\d{2})?(\.\d+)?(Z|[+-]\d{2}:?\d{2})?)?$/;
+
+export const NUMERIC_TITLE_REGEX = /^\d{8,14}$/;
+export const PLACEHOLDER_TAGS = new Set([
+	"inbox",
+	"origin/thought",
+	"origin-thought",
+	"untagged",
+]);
 
 export interface OKFValidationResult {
 	isValid: boolean;
@@ -40,6 +75,7 @@ export interface ConnectedNoteValidation {
 	file: TFile;
 	direction: "outgoing" | "incoming" | "both";
 	validation: OKFValidationResult;
+	isAsymmetricHub: boolean;
 }
 
 export interface ConnectedConformanceReport {
@@ -48,6 +84,7 @@ export interface ConnectedConformanceReport {
 	connectedNotes: ConnectedNoteValidation[];
 	validConnectedCount: number;
 	invalidConnectedNotes: ConnectedNoteValidation[];
+	asymmetricHubNotes: ConnectedNoteValidation[];
 	unresolvedLinks: string[];
 	allConformant: boolean;
 }
@@ -59,6 +96,15 @@ export interface VaultConformanceSummary {
 	invalidNotes: Array<{
 		file: TFile;
 		validation: OKFValidationResult;
+	}>;
+	inboxNotes: Array<{
+		file: TFile;
+		validation: OKFValidationResult;
+	}>;
+	orphanNotes: TFile[];
+	asymmetricLinks: Array<{
+		sourceFile: TFile;
+		hubFile: TFile;
 	}>;
 	durationMs: number;
 }
@@ -73,8 +119,6 @@ export interface VaultDiscoveryReport {
 	dimensionMismatchesPruned: number;
 	primaryVectorDimension: number | null;
 	discoveredTypes: string[];
-	discoveredStatuses: string[];
-	topTags: string[];
 	resolvedInboxFolder: string;
 	issues: string[];
 }
@@ -83,8 +127,7 @@ export class OKFManager {
 	private app: App;
 	private plugin: LatticePlugin;
 	private cachedTypes: string[] | null = null;
-	private cachedStatuses: string[] | null = null;
-	private cachedTopTags: string[] = [];
+	private cachedTypeFolderMap: Record<string, string> | null = null;
 	private lastDiscoveryReport: VaultDiscoveryReport | null = null;
 	private lastVaultConformanceSummary: VaultConformanceSummary | null = null;
 
@@ -106,21 +149,18 @@ export class OKFManager {
 	 */
 	public invalidateDiscoveryCache(): void {
 		this.cachedTypes = null;
-		this.cachedStatuses = null;
+		this.cachedTypeFolderMap = null;
 	}
 
 	/**
 	 * Lightweight Startup Discovery & Consistency Check:
 	 * Scans vault metadata cache and vector store in memory (<5ms, zero LLM calls) to:
-	 * 1. Discover vault-specific `type`, `status`, and `tags` conventions (decoupling plugin from hardcoded schemas).
+	 * 1. Normalize note types to the 4 core types (`note`, `paper`, `topic`, `project`).
 	 * 2. Auto-detect existing Inbox folder conventions if the default folder doesn't exist.
 	 * 3. Prune orphaned vector records (deleted/excluded files) and mismatched vector dimensions.
 	 * 4. Compute vault indexing & OKF consistency metrics.
 	 */
 	public async runStartupDiscovery(showNotice = false): Promise<VaultDiscoveryReport> {
-		const typesMap = new Map<string, string>(); // lowercase -> canonical casing
-		const statusesMap = new Map<string, string>();
-		const tagCounts = new Map<string, number>();
 		const issues: string[] = [];
 
 		const store = this.plugin?.indexer?.getStore?.() || {};
@@ -147,13 +187,6 @@ export class OKFManager {
 			}
 			const dim = rec.vector.length;
 			dimCounts.set(dim, (dimCounts.get(dim) || 0) + 1);
-
-			if (rec.type && typeof rec.type === "string" && rec.type.trim()) {
-				const trimmed = rec.type.trim();
-				if (trimmed.toLowerCase() !== "log" && !typesMap.has(trimmed.toLowerCase())) {
-					typesMap.set(trimmed.toLowerCase(), trimmed);
-				}
-			}
 		}
 
 		// Determine dominant vector dimension (e.g. 768 for nomic-embed-text)
@@ -183,55 +216,38 @@ export class OKFManager {
 			issues.push(`Cleaned up ${orphanedVectorsPruned} orphaned vector cache record(s).`);
 		}
 
-		// 2. Scan vault frontmatter via metadataCache to discover types, statuses, and tags
+		// 2. Discover folder-backed OKF types from existing vault folders + baseline settings
+		const discoveredMap: Record<string, string> = {
+			...OKF_TYPE_FOLDER_MAP,
+			...(this.plugin?.settings?.typeFolderMap || {}),
+		};
+
 		for (const file of indexableFiles) {
+			if (this.isNoteInInbox(file)) continue;
+			const normPath = file.path.replace(/^\/+/, "");
+			const slashIdx = normPath.indexOf("/");
+			if (slashIdx <= 0) continue; // Only learn from organized subfolders
+
 			const cache = this.app?.metadataCache?.getFileCache?.(file);
-			const fm = cache?.frontmatter as OKFFrontmatter | undefined;
-			if (!fm) continue;
-
-			if (typeof fm.type === "string" && fm.type.trim()) {
-				const t = fm.type.trim();
-				if (t.toLowerCase() !== "log" && !typesMap.has(t.toLowerCase())) {
-					typesMap.set(t.toLowerCase(), t);
+			const rawType = cache?.frontmatter?.type;
+			if (
+				typeof rawType === "string" &&
+				/^[a-z][a-z0-9_-]*$/i.test(rawType.trim())
+			) {
+				const lower = rawType.trim().toLowerCase();
+				if (
+					!discoveredMap[lower] &&
+					!SOURCE_TYPE_ALIASES.has(lower) &&
+					!NOTE_TYPE_ALIASES.has(lower)
+				) {
+					const topFolder = normPath.slice(0, slashIdx);
+					discoveredMap[lower] = topFolder;
 				}
 			}
-
-			if (typeof fm.status === "string" && fm.status.trim()) {
-				const s = fm.status.trim();
-				if (!statusesMap.has(s.toLowerCase())) {
-					statusesMap.set(s.toLowerCase(), s);
-				}
-			}
-
-			const tags = VectorIndexer.normalizeTags(fm.tags);
-			for (const tag of tags) {
-				const lower = tag.toLowerCase();
-				tagCounts.set(lower, (tagCounts.get(lower) || 0) + 1);
-			}
 		}
 
-		// Fallback to canonical OKF defaults if the vault has no typed/status notes yet
-		if (typesMap.size === 0) {
-			for (const t of VALID_OKF_TYPES) {
-				typesMap.set(t.toLowerCase(), t);
-			}
-		}
-		if (statusesMap.size === 0) {
-			for (const s of VALID_OKF_STATUSES) {
-				statusesMap.set(s.toLowerCase(), s);
-			}
-		}
-
-		this.cachedTypes = Array.from(typesMap.values()).sort((a, b) =>
-			a.localeCompare(b, undefined, { sensitivity: "base" })
-		);
-		this.cachedStatuses = Array.from(statusesMap.values()).sort((a, b) =>
-			a.localeCompare(b, undefined, { sensitivity: "base" })
-		);
-		this.cachedTopTags = Array.from(tagCounts.entries())
-			.sort((a, b) => b[1] - a[1])
-			.slice(0, 15)
-			.map(([tag]) => tag);
+		this.cachedTypeFolderMap = discoveredMap;
+		this.cachedTypes = Object.keys(discoveredMap);
 
 		// 3. Evaluate note indexing & OKF frontmatter completeness across the vault
 		let indexedNotes = 0;
@@ -249,11 +265,7 @@ export class OKFManager {
 
 			const cache = this.app?.metadataCache?.getFileCache?.(file);
 			const fm = (cache?.frontmatter || {}) as OKFFrontmatter;
-			const val = OKFManager.validateFrontmatter(
-				fm,
-				this.cachedTypes,
-				this.cachedStatuses
-			);
+			const val = OKFManager.validateFrontmatter(fm, this.cachedTypes);
 			if (val.isValid) {
 				validOkfNotes++;
 			} else {
@@ -261,15 +273,21 @@ export class OKFManager {
 			}
 		}
 
-		// 4. Resolve Inbox folder (decouple from hardcoded 00_Inbox if vault uses another convention)
-		let resolvedInboxFolder = this.plugin?.settings?.inboxFolder || "00_Inbox";
+		// 3. Resolve Inbox folder
+		let resolvedInboxFolder = this.plugin?.settings?.inboxFolder || "inbox";
 		if (this.app?.vault?.adapter?.exists) {
 			const configuredExists = await this.app.vault.adapter.exists(
 				normalizePath(resolvedInboxFolder)
 			);
-			if (!configuredExists && resolvedInboxFolder === "00_Inbox") {
+			if (
+				!configuredExists &&
+				(resolvedInboxFolder === "inbox" ||
+					resolvedInboxFolder === "00_Inbox")
+			) {
 				const candidates = [
+					"inbox",
 					"Inbox",
+					"00_Inbox",
 					"00-Inbox",
 					"_inbox",
 					"01_Inbox",
@@ -306,8 +324,6 @@ export class OKFManager {
 			dimensionMismatchesPruned,
 			primaryVectorDimension,
 			discoveredTypes: this.cachedTypes,
-			discoveredStatuses: this.cachedStatuses,
-			topTags: this.cachedTopTags,
 			resolvedInboxFolder,
 			issues,
 		};
@@ -318,7 +334,7 @@ export class OKFManager {
 			const issueSuffix =
 				issues.length > 0 ? ` (${issues.length} consistency fix(es) applied)` : "";
 			new Notice(
-				`Lattice Discovery: ${indexedNotes}/${indexableFiles.length} notes indexed, ${this.cachedTypes.length} note types [${this.cachedTypes.join(", ")}]${issueSuffix}.`
+				`Lattice Discovery: ${indexedNotes}/${indexableFiles.length} notes indexed (${validOkfNotes} OKF conformant)${issueSuffix}.`
 			);
 		}
 
@@ -326,112 +342,77 @@ export class OKFManager {
 	}
 
 	/**
-	 * Dynamically returns OKF types present across the vault and indexed records.
-	 * Decouples the plugin from any single hardcoded note schema.
+	 * Returns the active `type -> folder` routing map (4 core defaults + any folder-backed types discovered in the vault).
+	 */
+	public getTypeFolderMap(): Record<string, string> {
+		if (this.cachedTypeFolderMap) {
+			return this.cachedTypeFolderMap;
+		}
+		this.cachedTypeFolderMap = {
+			...OKF_TYPE_FOLDER_MAP,
+			...(this.plugin?.settings?.typeFolderMap || {}),
+		};
+		return this.cachedTypeFolderMap;
+	}
+
+	/**
+	 * Returns the active folder-aligned OKF types for this vault (defaults to `note`, `paper`, `topic`, `project`).
 	 */
 	public getDiscoveredTypes(): string[] {
 		if (this.cachedTypes && this.cachedTypes.length > 0) {
 			return this.cachedTypes;
 		}
-
-		const typesMap = new Map<string, string>();
-
-		// 1. Collect from currently indexed store
-		const store = this.plugin?.indexer?.getStore?.() || {};
-		for (const rec of Object.values(store)) {
-			if (rec.type && typeof rec.type === "string" && rec.type.trim()) {
-				const t = rec.type.trim();
-				if (t.toLowerCase() !== "log" && !typesMap.has(t.toLowerCase())) {
-					typesMap.set(t.toLowerCase(), t);
-				}
-			}
-		}
-
-		// 2. Collect from vault markdown files via metadata cache
-		if (this.app?.vault?.getMarkdownFiles && this.app?.metadataCache?.getFileCache) {
-			const files = this.app.vault.getMarkdownFiles();
-			for (const file of files) {
-				const cache = this.app.metadataCache.getFileCache(file);
-				const t = cache?.frontmatter?.type;
-				if (typeof t === "string" && t.trim()) {
-					const trimmed = t.trim();
-					if (
-						trimmed.toLowerCase() !== "log" &&
-						!typesMap.has(trimmed.toLowerCase())
-					) {
-						typesMap.set(trimmed.toLowerCase(), trimmed);
-					}
-				}
-			}
-		}
-
-		// 3. Fallback to default OKF types if vault has no typed notes yet
-		if (typesMap.size === 0) {
-			for (const t of VALID_OKF_TYPES) {
-				typesMap.set(t.toLowerCase(), t);
-			}
-		}
-
-		this.cachedTypes = Array.from(typesMap.values()).sort((a, b) =>
-			a.localeCompare(b, undefined, { sensitivity: "base" })
-		);
+		this.cachedTypes = Object.keys(this.getTypeFolderMap());
 		return this.cachedTypes;
 	}
 
 	/**
-	 * Dynamically returns statuses used across the vault, falling back to `seed | growing | evergreen`.
-	 */
-	public getDiscoveredStatuses(): string[] {
-		if (this.cachedStatuses && this.cachedStatuses.length > 0) {
-			return this.cachedStatuses;
-		}
-
-		const statusesMap = new Map<string, string>();
-		if (this.app?.vault?.getMarkdownFiles && this.app?.metadataCache?.getFileCache) {
-			const files = this.app.vault.getMarkdownFiles();
-			for (const file of files) {
-				const cache = this.app.metadataCache.getFileCache(file);
-				const s = cache?.frontmatter?.status;
-				if (typeof s === "string" && s.trim()) {
-					const trimmed = s.trim();
-					if (!statusesMap.has(trimmed.toLowerCase())) {
-						statusesMap.set(trimmed.toLowerCase(), trimmed);
-					}
-				}
-			}
-		}
-
-		if (statusesMap.size === 0) {
-			for (const s of VALID_OKF_STATUSES) {
-				statusesMap.set(s.toLowerCase(), s);
-			}
-		}
-
-		this.cachedStatuses = Array.from(statusesMap.values()).sort((a, b) =>
-			a.localeCompare(b, undefined, { sensitivity: "base" })
-		);
-		return this.cachedStatuses;
-	}
-
-	public getDiscoveredTags(): string[] {
-		return this.cachedTopTags;
-	}
-
-	/**
-	 * Validates a note's frontmatter against the vault's discovered OKF schema.
+	 * Validates a note's frontmatter against the 4-type, 5-field OKF schema.
+	 * Enforces `okf_validate.py` reserved-file rule: `log.md` must have NO frontmatter.
 	 */
 	public validateFile(file: TFile): OKFValidationResult {
 		const cache = this.app?.metadataCache?.getFileCache?.(file);
+		if (file.name.toLowerCase() === "log.md") {
+			const hasFm = Boolean(
+				cache?.frontmatter && Object.keys(cache.frontmatter).length > 0
+			);
+			return {
+				isValid: !hasFm,
+				missingFields: [],
+				warnings: hasFm ? ["log.md must have no frontmatter"] : [],
+				frontmatter: (cache?.frontmatter || {}) as OKFFrontmatter,
+			};
+		}
 		const fm = (cache?.frontmatter || {}) as OKFFrontmatter;
-		return OKFManager.validateFrontmatter(
-			fm,
-			this.getDiscoveredTypes(),
-			this.getDiscoveredStatuses()
+		return OKFManager.validateFrontmatter(fm, this.getDiscoveredTypes());
+	}
+
+	/**
+	 * Checks whether `file` is located inside the configured `inbox/` staging folder.
+	 */
+	public isNoteInInbox(file: TFile): boolean {
+		const inboxPrefix = (this.plugin?.settings?.inboxFolder || "inbox")
+			.replace(/^\/+|\/+$/g, "")
+			.toLowerCase();
+		const normPath = file.path.replace(/^\/+/, "").toLowerCase();
+		return (
+			normPath.startsWith(inboxPrefix + "/") ||
+			normPath.startsWith("inbox/")
 		);
 	}
 
 	/**
-	 * Post-Header-Change Verification (Note + Connected Notes):
+	 * Returns the canonical folder (`notes`, `sources/literature`, `topics`, `projects`, etc.)
+	 * for a given OKF `type` using the vault's discovered `type -> folder` map.
+	 */
+	public getTargetFolderForType(type: unknown): string {
+		const lower = typeof type === "string" ? type.trim().toLowerCase() : "note";
+		const map = this.getTypeFolderMap();
+		return map[lower] || map.note || "notes";
+	}
+
+	/**
+	 * Post-Header-Change Verification (Note + Connected Notes + Asymmetric Hub Check):
 	 * Pure in-memory (<0.5ms, zero disk I/O, zero LLM calls) check of `file` AND its
 	 * outgoing linked notes + incoming backlinked notes via `app.metadataCache.resolvedLinks`.
 	 */
@@ -449,19 +430,23 @@ export class OKFManager {
 			})?.unresolvedLinks || {};
 
 		const directionMap = new Map<string, "outgoing" | "incoming" | "both">();
+		const fileNorm = file.path.replace(/^\/+/, "");
 
 		// 1. Outgoing links from file.path
-		const outgoingTargets = resolvedLinks[file.path] || {};
-		for (const [targetPath, count] of Object.entries(outgoingTargets)) {
-			if (count > 0 && targetPath !== file.path) {
+		const outgoingTargets =
+			resolvedLinks[file.path] || resolvedLinks["/" + fileNorm] || {};
+		for (const [rawTarget, count] of Object.entries(outgoingTargets)) {
+			const targetPath = rawTarget.replace(/^\/+/, "");
+			if (count > 0 && targetPath !== fileNorm) {
 				directionMap.set(targetPath, "outgoing");
 			}
 		}
 
 		// 2. Incoming backlinks pointing to file.path
-		for (const [sourcePath, targets] of Object.entries(resolvedLinks)) {
-			if (sourcePath === file.path) continue;
-			if (targets && targets[file.path] > 0) {
+		for (const [rawSource, targets] of Object.entries(resolvedLinks)) {
+			const sourcePath = rawSource.replace(/^\/+/, "");
+			if (sourcePath === fileNorm || !targets) continue;
+			if ((targets[fileNorm] || targets["/" + fileNorm] || 0) > 0) {
 				const existing = directionMap.get(sourcePath);
 				directionMap.set(
 					sourcePath,
@@ -474,12 +459,13 @@ export class OKFManager {
 		const mdFilesByPath = new Map<string, TFile>();
 		if (!this.app?.vault?.getAbstractFileByPath && this.app?.vault?.getMarkdownFiles) {
 			for (const f of this.app.vault.getMarkdownFiles()) {
-				mdFilesByPath.set(f.path, f);
+				mdFilesByPath.set(f.path.replace(/^\/+/, ""), f);
 			}
 		}
 
 		const connectedNotes: ConnectedNoteValidation[] = [];
 		const invalidConnectedNotes: ConnectedNoteValidation[] = [];
+		const asymmetricHubNotes: ConnectedNoteValidation[] = [];
 		let validConnectedCount = 0;
 
 		for (const [connectedPath, direction] of directionMap.entries()) {
@@ -504,10 +490,18 @@ export class OKFManager {
 			}
 
 			const validation = this.validateFile(targetFile);
+			const targetType = String(validation.frontmatter.type || "")
+				.trim()
+				.toLowerCase();
+			// okf_lint.py ASYMMETRIC rule: concept links a hub (topic/org/place/project/role) that does not link back
+			const isAsymmetricHub =
+				direction === "outgoing" && HUB_OKF_TYPES.has(targetType);
+
 			const entry: ConnectedNoteValidation = {
 				file: targetFile,
 				direction,
 				validation,
+				isAsymmetricHub,
 			};
 			connectedNotes.push(entry);
 			if (validation.isValid) {
@@ -515,17 +509,27 @@ export class OKFManager {
 			} else {
 				invalidConnectedNotes.push(entry);
 			}
+			if (isAsymmetricHub) {
+				asymmetricHubNotes.push(entry);
+			}
 		}
 
-		// Sort connected notes so non-conformant ones appear first
+		// Sort connected notes so non-conformant or asymmetric hubs appear first
 		connectedNotes.sort((a, b) => {
 			if (a.validation.isValid !== b.validation.isValid) {
 				return a.validation.isValid ? 1 : -1;
 			}
+			if (a.isAsymmetricHub !== b.isAsymmetricHub) {
+				return a.isAsymmetricHub ? -1 : 1;
+			}
 			return a.file.basename.localeCompare(b.file.basename);
 		});
 
-		const unresolvedLinks = Object.entries(unresolvedLinksMap[file.path] || {})
+		const unresolvedLinks = Object.entries(
+			unresolvedLinksMap[file.path] ||
+				unresolvedLinksMap["/" + fileNorm] ||
+				{}
+		)
 			.filter(([, count]) => count > 0)
 			.map(([linkText]) => linkText);
 
@@ -535,26 +539,40 @@ export class OKFManager {
 			connectedNotes,
 			validConnectedCount,
 			invalidConnectedNotes,
+			asymmetricHubNotes,
 			unresolvedLinks,
 			allConformant:
 				noteValidation.isValid &&
 				invalidConnectedNotes.length === 0 &&
+				asymmetricHubNotes.length === 0 &&
 				unresolvedLinks.length === 0,
 		};
 	}
 
 	/**
-	 * Ultra-Lightweight Full-Vault OKF Conformance Scan:
+	 * Ultra-Lightweight Full-Vault OKF Conformance & Graph Lint Scan (`okf_validate.py` + `okf_lint.py`):
 	 * Scans all indexable markdown notes in memory via `app.metadataCache` (<2ms, zero disk I/O, zero LLM calls).
 	 */
 	public scanVaultOKFConformance(showNotice = false): VaultConformanceSummary {
 		const t0 =
 			typeof performance !== "undefined" ? performance.now() : Date.now();
 		const allFiles = this.app?.vault?.getMarkdownFiles?.() || [];
+		const resolvedLinks: Record<string, Record<string, number>> =
+			(this.app?.metadataCache as unknown as {
+				resolvedLinks?: Record<string, Record<string, number>>;
+			})?.resolvedLinks || {};
+
 		const invalidNotes: Array<{
 			file: TFile;
 			validation: OKFValidationResult;
 		}> = [];
+		const inboxNotes: Array<{
+			file: TFile;
+			validation: OKFValidationResult;
+		}> = [];
+
+		const indexableByPath = new Map<string, TFile>();
+		const typeByPath = new Map<string, string>();
 		let totalNotes = 0;
 		let validCount = 0;
 
@@ -565,12 +583,83 @@ export class OKFManager {
 			) {
 				continue;
 			}
-			totalNotes++;
+			const normPath = file.path.replace(/^\/+/, "");
+			const inInbox = this.isNoteInInbox(file);
 			const validation = this.validateFile(file);
+
+			if (inInbox) {
+				if (!validation.isValid) {
+					inboxNotes.push({ file, validation });
+				} else {
+					totalNotes++;
+					validCount++;
+				}
+				continue;
+			}
+
+			totalNotes++;
+			indexableByPath.set(normPath, file);
+			typeByPath.set(
+				normPath,
+				String(validation.frontmatter.type || "").trim().toLowerCase()
+			);
+
 			if (validation.isValid) {
 				validCount++;
 			} else {
 				invalidNotes.push({ file, validation });
+			}
+		}
+
+		// Graph Lint (in-memory ORPHAN & ASYMMETRIC checks from okf_lint.py)
+		const inboundCount = new Map<string, number>();
+		const asymmetricLinks: Array<{ sourceFile: TFile; hubFile: TFile }> = [];
+
+		for (const normPath of indexableByPath.keys()) {
+			inboundCount.set(normPath, 0);
+		}
+
+		for (const [rawSrc, targets] of Object.entries(resolvedLinks)) {
+			const srcPath = rawSrc.replace(/^\/+/, "");
+			const srcFile = indexableByPath.get(srcPath);
+			if (!srcFile || !targets) continue;
+
+			for (const [rawTgt, count] of Object.entries(targets)) {
+				if (count <= 0) continue;
+				const tgtPath = rawTgt.replace(/^\/+/, "");
+				if (tgtPath === srcPath) continue;
+				const tgtFile = indexableByPath.get(tgtPath);
+				if (!tgtFile) continue;
+
+				inboundCount.set(tgtPath, (inboundCount.get(tgtPath) || 0) + 1);
+
+				const tgtType = typeByPath.get(tgtPath) || "";
+				if (HUB_OKF_TYPES.has(tgtType)) {
+					const reverseTargets =
+						resolvedLinks[tgtPath] ||
+						resolvedLinks["/" + tgtPath] ||
+						{};
+					const linksBack =
+						(reverseTargets[srcPath] ||
+							reverseTargets["/" + srcPath] ||
+							0) > 0;
+					if (!linksBack) {
+						asymmetricLinks.push({
+							sourceFile: srcFile,
+							hubFile: tgtFile,
+						});
+					}
+				}
+			}
+		}
+
+		const orphanNotes: TFile[] = [];
+		if (Object.keys(resolvedLinks).length > 0) {
+			for (const [normPath, file] of indexableByPath.entries()) {
+				if (normPath.toLowerCase() === "topics/overview.md") continue;
+				if ((inboundCount.get(normPath) || 0) === 0) {
+					orphanNotes.push(file);
+				}
 			}
 		}
 
@@ -591,19 +680,26 @@ export class OKFManager {
 			validCount,
 			invalidCount: invalidNotes.length,
 			invalidNotes,
+			inboxNotes,
+			orphanNotes,
+			asymmetricLinks,
 			durationMs,
 		};
 
 		this.lastVaultConformanceSummary = summary;
 
 		if (showNotice) {
+			const inboxSuffix =
+				inboxNotes.length > 0
+					? `, ${inboxNotes.length} in inbox/`
+					: "";
 			if (summary.invalidCount === 0) {
 				new Notice(
-					`Lattice OKF Check: All ${summary.totalNotes} notes are 100% OKF conformant (${summary.durationMs}ms).`
+					`Lattice OKF Check: All ${summary.totalNotes} concepts are OKF conformant${inboxSuffix} (${summary.durationMs}ms).`
 				);
 			} else {
 				new Notice(
-					`Lattice OKF Check: ${summary.validCount}/${summary.totalNotes} notes conformant, ${summary.invalidCount} need OKF headers (${summary.durationMs}ms).`
+					`Lattice OKF Check: ${summary.validCount}/${summary.totalNotes} conformant, ${summary.invalidCount} error(s)${inboxSuffix} (${summary.durationMs}ms).`
 				);
 			}
 		}
@@ -611,34 +707,45 @@ export class OKFManager {
 		return summary;
 	}
 
+	/**
+	 * Validates frontmatter against the simplified 4-type (`note`, `paper`, `topic`, `project`),
+	 * 5-field (`type`, `title`, `description`, `tags`, `timestamp`) OKF schema:
+	 * - Flags missing core fields (`type`, `title`, `description`, `tags`, `timestamp`).
+	 * - Flags legacy header drift (`created`, `origin`, `status`), placeholder tags (`inbox`, `origin/thought`),
+	 *   and raw numeric timestamp titles (e.g. `"202610261411"`).
+	 */
 	public static validateFrontmatter(
 		fm: OKFFrontmatter,
-		allowedTypes?: string[],
-		allowedStatuses?: string[]
+		allowedTypes?: string[]
 	): OKFValidationResult {
 		const missingFields: string[] = [];
 		const warnings: string[] = [];
 		const knownTypes =
-			allowedTypes && allowedTypes.length > 0 ? allowedTypes : VALID_OKF_TYPES;
-		const knownStatuses =
-			allowedStatuses && allowedStatuses.length > 0
-				? allowedStatuses
-				: VALID_OKF_STATUSES;
+			allowedTypes && allowedTypes.length > 0
+				? allowedTypes
+				: VALID_OKF_TYPES;
 
-		if (!fm.type || typeof fm.type !== "string") {
+		if (!fm.type || typeof fm.type !== "string" || !fm.type.trim()) {
 			missingFields.push("type");
-		} else if (
-			!knownTypes.some(
-				(t) => t.toLowerCase() === String(fm.type).trim().toLowerCase()
-			)
-		) {
-			warnings.push(
-				`Non-standard type "${fm.type}". Expected one of: ${knownTypes.join(" | ")}`
-			);
+		} else {
+			const typeStr = String(fm.type).trim().toLowerCase();
+			const matchesKnown =
+				knownTypes.some((t) => t.toLowerCase() === typeStr) ||
+				VALID_OKF_TYPES.some((t) => t.toLowerCase() === typeStr) ||
+				SOURCE_TYPE_ALIASES.has(typeStr);
+			if (!matchesKnown) {
+				warnings.push(
+					`Non-standard type "${fm.type}". Expected one of: ${VALID_OKF_TYPES.join(" | ")}`
+				);
+			}
 		}
 
 		if (!fm.title || typeof fm.title !== "string" || !fm.title.trim()) {
 			missingFields.push("title");
+		} else if (NUMERIC_TITLE_REGEX.test(fm.title.trim())) {
+			warnings.push(
+				`Title "${fm.title}" is a raw timestamp slug (click Enrich OKF to generate a human title)`
+			);
 		}
 
 		if (
@@ -650,23 +757,32 @@ export class OKFManager {
 		}
 
 		const normalizedTags = VectorIndexer.normalizeTags(fm.tags);
+		const meaningfulTags = normalizedTags.filter(
+			(t) => !PLACEHOLDER_TAGS.has(t.toLowerCase())
+		);
 		if (normalizedTags.length === 0) {
 			missingFields.push("tags");
-		}
-
-		if (!fm.created) {
-			missingFields.push("created");
-		}
-
-		if (!fm.status || typeof fm.status !== "string") {
-			missingFields.push("status");
-		} else if (
-			!knownStatuses.some(
-				(s) => s.toLowerCase() === String(fm.status).trim().toLowerCase()
-			)
-		) {
+		} else if (meaningfulTags.length === 0) {
 			warnings.push(
-				`Non-standard status "${fm.status}". Expected: ${knownStatuses.join(" | ")}`
+				"Only placeholder capture tags (`inbox`, `origin/thought`) present"
+			);
+		}
+
+		if (!fm.timestamp) {
+			missingFields.push("timestamp");
+		} else if (
+			typeof fm.timestamp === "string" &&
+			!ISO_TIMESTAMP_REGEX.test(fm.timestamp.trim())
+		) {
+			warnings.push(`Timestamp "${fm.timestamp}" is not ISO 8601.`);
+		}
+
+		const legacyKeys = ["created", "origin", "status"].filter(
+			(k) => fm[k] !== undefined && fm[k] !== null && String(fm[k]).trim() !== ""
+		);
+		if (legacyKeys.length > 0) {
+			warnings.push(
+				`Redundant legacy header key(s): ${legacyKeys.join(", ")}`
 			);
 		}
 
@@ -690,49 +806,54 @@ export class OKFManager {
 	}
 
 	/**
-	 * Normalizes an OKF type against dynamically discovered vault types or defaults.
+	 * Formats current UTC timestamp as ISO 8601 (`YYYY-MM-DDTHH:mm:ssZ`), matching `meta/okf-spec.md`.
 	 */
-	public normalizeType(raw: unknown): string {
-		return OKFManager.normalizeType(raw, this.getDiscoveredTypes());
-	}
-
-	public static normalizeType(raw: unknown, knownTypes?: string[]): string {
-		const list =
-			knownTypes && knownTypes.length > 0 ? knownTypes : VALID_OKF_TYPES;
-		if (typeof raw !== "string" || !raw.trim()) return list[0] || "Concept";
-		const trimmed = raw.trim();
-		const match = list.find(
-			(t) => t.toLowerCase() === trimmed.toLowerCase()
-		);
-		return match || trimmed;
+	public static nowISOUTC(): string {
+		return new Date().toISOString().replace(/\.\d{3}Z$/, "Z");
 	}
 
 	/**
-	 * Normalizes an OKF status against dynamically discovered vault statuses or defaults.
+	 * Converts a concept title into a lowercase kebab-case slug per `meta/okf-spec.md`.
 	 */
-	public normalizeStatus(raw: unknown): string {
-		return OKFManager.normalizeStatus(raw, this.getDiscoveredStatuses());
+	public static toKebabSlug(raw: string): string {
+		return raw
+			.toLowerCase()
+			.replace(/['’]/g, "")
+			.replace(/[^a-z0-9]+/g, "-")
+			.replace(/-+/g, "-")
+			.replace(/^-|-$/g, "")
+			.slice(0, 80);
 	}
 
-	public static normalizeStatus(raw: unknown, knownStatuses?: string[]): string {
-		const list =
-			knownStatuses && knownStatuses.length > 0
-				? knownStatuses
-				: VALID_OKF_STATUSES;
-		if (typeof raw !== "string" || !raw.trim()) return list[0] || "seed";
-		const trimmed = raw.trim();
-		const match = list.find(
-			(s) => s.toLowerCase() === trimmed.toLowerCase()
-		);
-		return match || list[0] || "seed";
+	/**
+	 * Normalizes an OKF type into one of the vault's active folder-aligned types.
+	 */
+	public normalizeType(raw: unknown): string {
+		if (typeof raw === "string" && raw.trim()) {
+			const lower = raw.trim().toLowerCase();
+			const map = this.getTypeFolderMap();
+			if (map[lower]) return lower;
+		}
+		return OKFManager.normalizeType(raw);
+	}
+
+	public static normalizeType(raw: unknown): string {
+		if (typeof raw !== "string" || !raw.trim()) return "note";
+		const lower = raw.trim().toLowerCase();
+		if (lower === "topic") return "topic";
+		if (lower === "project") return "project";
+		if (SOURCE_TYPE_ALIASES.has(lower)) return "paper";
+		if (NOTE_TYPE_ALIASES.has(lower)) return "note";
+		const match = VALID_OKF_TYPES.find((t) => t.toLowerCase() === lower);
+		return match || "note";
 	}
 
 	/**
 	 * Command: `Lattice: Enrich OKF Frontmatter`
-	 * Lifecycle-aware OKF header enrichment:
-	 * - Post new-note creation: adds `type`, `title`, `description`, `tags`, `created`, and `status` based on note content.
-	 * - Later in the note lifecycle (when content changes): updates `type`, `title`, `description`, `tags`, and `status`
-	 *   to reflect the latest note content while preserving `created` and any custom YAML keys.
+	 * Lifecycle-aware 5-field OKF header enrichment (`type`, `title`, `description`, `tags`, `timestamp`):
+	 * - Generates tags strictly from the note's own prose (never injecting unrelated vault-wide tags).
+	 * - Deterministically guards `type` so personal notes are never misclassified as `paper`.
+	 * - Strips redundant legacy header keys (`created`, `origin`, `status`) and placeholder tags (`inbox`, `origin/thought`).
 	 * - Immediately verifies OKF conformance of the note and its connected notes after updating headers.
 	 */
 	public async enrichNoteFrontmatter(
@@ -755,29 +876,34 @@ export class OKFManager {
 		);
 
 		try {
-			const discoveredTypes = this.getDiscoveredTypes();
-			const discoveredStatuses = this.getDiscoveredStatuses();
-			const existingTagHints =
-				this.cachedTopTags.length > 0
-					? `Existing vault tags (reuse where appropriate): ${this.cachedTopTags.join(", ")}`
-					: "";
+			const cache = this.app?.metadataCache?.getFileCache?.(file);
+			const existingFm = (cache?.frontmatter || {}) as OKFFrontmatter;
+			const normPath = file.path.replace(/^\/+/, "").toLowerCase();
+			const isExternalSource =
+				normPath.startsWith("sources/") ||
+				Boolean(existingFm.resource || existingFm.doi || existingFm.authors);
+
+			const isNumericFilename = NUMERIC_TITLE_REGEX.test(file.basename.trim());
+			const filenameHint = isNumericFilename
+				? "(Filename is a numeric timestamp; derive a descriptive human title from the Note Content below)"
+				: `Note Filename: ${file.basename}`;
 
 			const prompt = [
 				"You are an Open Knowledge Format (OKF) metadata generator for an Obsidian knowledge vault.",
-				"Analyze the following note and return a strict JSON object with these keys:",
-				`- "type": Must be one of ${discoveredTypes.map((t) => `"${t}"`).join(", ")}.`,
-				'- "title": Clear, explicit concept title.',
-				'- "description": Single-sentence high-signal summary of the atomic concept (max 160 chars).',
-				'- "tags": Array of 2 to 5 normalized lowercase kebab-case domain tags.',
-				`- "status": Must be one of ${discoveredStatuses.map((s) => `"${s}"`).join(", ")}.`,
-				existingTagHints,
+				"Analyze ONLY the Note Content below and return a strict JSON object with these 4 keys:",
+				'- "type": Must be one of "note", "paper", "topic", "project".',
+				'  * Use "note" (default) for personal notes, ideas, learnings, plans, or syntheses.',
+				'  * Use "paper" ONLY if the note summarizes an external published paper, book, or article.',
+				'  * Use "topic" ONLY if the note is a Map-of-Content hub indexing multiple notes.',
+				'  * Use "project" ONLY if the note tracks a specific project.',
+				'- "title": Clear, human-readable concept title (never use a numeric timestamp as the title).',
+				'- "description": Single-sentence high-signal summary of the note (max 160 chars).',
+				'- "tags": Array of 2 to 4 lowercase kebab-case tags derived STRICTLY from the topics in this note (do NOT invent unrelated science or chemistry tags).',
 				"",
-				`Note Filename: ${file.basename}`,
+				filenameHint,
 				"Note Content:",
 				body.slice(0, 6000),
-			]
-				.filter(Boolean)
-				.join("\n");
+			].join("\n");
 
 			const response = await requestUrl({
 				url: `${this.plugin.settings.ollamaUrl}/api/generate`,
@@ -817,36 +943,67 @@ export class OKFManager {
 						.replace(/-+/g, "-")
 						.replace(/^-|-$/g, "")
 				)
-				.filter(Boolean)
-				.slice(0, 5);
+				.filter((t) => Boolean(t) && !PLACEHOLDER_TAGS.has(t))
+				.slice(0, 4);
+
+			// Deterministic type guard: prevent personal notes from being misclassified as `paper`
+			let resolvedType = this.normalizeType(generated.type);
+			if (normPath.startsWith("projects/")) {
+				resolvedType = "project";
+			} else if (normPath.startsWith("topics/") && existingFm.type === "topic") {
+				resolvedType = "topic";
+			} else if (isExternalSource) {
+				resolvedType = "paper";
+			} else if (resolvedType === "paper" && !isExternalSource) {
+				resolvedType = "note";
+			}
 
 			await this.app.fileManager.processFrontMatter(file, (fm) => {
 				if (refreshExisting || !fm.type) {
-					fm.type = this.normalizeType(generated.type);
+					fm.type = resolvedType;
 				}
-				if (refreshExisting || !fm.title) {
-					fm.title =
-						typeof generated.title === "string" && generated.title.trim()
+				const existingTitle =
+					typeof fm.title === "string" ? fm.title.trim() : "";
+				if (
+					refreshExisting ||
+					!existingTitle ||
+					NUMERIC_TITLE_REGEX.test(existingTitle)
+				) {
+					const candidateTitle =
+						typeof generated.title === "string" &&
+						generated.title.trim() &&
+						!NUMERIC_TITLE_REGEX.test(generated.title.trim())
 							? generated.title.trim()
-							: file.basename;
+							: !isNumericFilename
+							? file.basename
+							: "Untitled Note";
+					fm.title = candidateTitle;
 				}
 				if (refreshExisting || !fm.description) {
 					fm.description =
 						typeof generated.description === "string" &&
 						generated.description.trim()
 							? generated.description.trim()
-							: `Atomic note covering ${file.basename}.`;
+							: `Atomic note covering ${String(fm.title || file.basename)}.`;
 				}
-				const existingTags = VectorIndexer.normalizeTags(fm.tags);
+				const existingTags = VectorIndexer.normalizeTags(fm.tags).filter(
+					(t) => !PLACEHOLDER_TAGS.has(t.toLowerCase())
+				);
 				if (refreshExisting || existingTags.length === 0) {
-					fm.tags = cleanTags.length > 0 ? cleanTags : ["untagged"];
+					fm.tags =
+						cleanTags.length > 0
+							? cleanTags
+							: existingTags.length > 0
+							? existingTags
+							: ["note"];
 				}
-				if (!fm.created) {
-					fm.created = OKFManager.todayISO();
-				}
-				if (refreshExisting || !fm.status) {
-					fm.status = this.normalizeStatus(generated.status);
-				}
+				// Canonical 5th field: ISO 8601 UTC timestamp
+				fm.timestamp = OKFManager.nowISOUTC();
+
+				// Strip redundant legacy header fields so all notes share the clean 5-field header
+				delete fm.created;
+				delete fm.origin;
+				delete fm.status;
 			});
 
 			this.invalidateDiscoveryCache();
@@ -858,7 +1015,7 @@ export class OKFManager {
 					? ` | Connected: ${connectedReport.validConnectedCount}/${connectedReport.connectedNotes.length} OKF valid`
 					: "";
 			new Notice(
-				`Lattice: Updated OKF headers for "${file.basename}"${connectedSuffix}.`
+				`Lattice: Normalized OKF headers for "${file.basename}"${connectedSuffix}.`
 			);
 
 			// Re-index immediately with the enriched OKF metadata
@@ -908,22 +1065,140 @@ export class OKFManager {
 	}
 
 	/**
-	 * Checks whether `rawContent` already contains a [[WikiLink]] to `record`.
+	 * Appends a newest-first entry to the vault root `log.md` (matching `meta/tools/okf_log.py`).
+	 * `log.md` is a reserved OKF file and carries NO frontmatter.
+	 */
+	public async appendLogEntry(
+		operation: string,
+		description: string
+	): Promise<void> {
+		const date = OKFManager.todayISO();
+		const entry = `## [${date}] ${operation} | ${description}`;
+		const defaultHeader =
+			"# Log\n\nAppend-only operation history, newest first. Maintained by `meta/tools/okf_log.py`.\n";
+
+		const logPath = "log.md";
+		const existing = this.app?.vault?.getAbstractFileByPath?.(logPath);
+		if (existing instanceof TFile) {
+			await this.app.vault.process(existing, (content) => {
+				const lines = content.split(/\r?\n/);
+				const entryRegex = /^## \[?\d{4}-\d{2}-\d{2}/;
+				let splitIdx = -1;
+				for (let i = 0; i < lines.length; i++) {
+					if (entryRegex.test(lines[i])) {
+						splitIdx = i;
+						break;
+					}
+				}
+				if (splitIdx !== -1) {
+					const header =
+						lines.slice(0, splitIdx).join("\n").trimEnd() ||
+						defaultHeader.trimEnd();
+					const entries = lines.slice(splitIdx).join("\n").trimEnd();
+					return `${header}\n\n${entry}\n\n${entries}\n`;
+				}
+				const header = content.trimEnd() || defaultHeader.trimEnd();
+				return `${header}\n\n${entry}\n`;
+			});
+		} else if (this.app?.vault?.create) {
+			await this.app.vault.create(
+				logPath,
+				`${defaultHeader}\n${entry}\n`
+			);
+		}
+	}
+
+	/**
+	 * 1-Click `okf-refactor` Filing Helper:
+	 * Moves an enriched note from `inbox/` into its canonical OKF folder (`notes/`, `sources/web/`, `topics/`, `projects/`, etc.)
+	 * with a lowercase kebab-case filename derived from its title, and logs the operation in `log.md`.
+	 */
+	public async fileNoteFromInbox(file: TFile): Promise<TFile | null> {
+		const validation = this.validateFile(file);
+		const type = this.normalizeType(validation.frontmatter.type || "note");
+		const targetFolder = normalizePath(this.getTargetFolderForType(type));
+		const rawTitle =
+			typeof validation.frontmatter.title === "string" &&
+			validation.frontmatter.title.trim()
+				? validation.frontmatter.title.trim()
+				: file.basename;
+		const slug = OKFManager.toKebabSlug(rawTitle) || OKFManager.toKebabSlug(file.basename) || "note";
+
+		if (
+			this.app.vault.adapter?.exists &&
+			!(await this.app.vault.adapter.exists(targetFolder))
+		) {
+			await this.app.vault.createFolder(targetFolder);
+		}
+
+		let newPath = normalizePath(`${targetFolder}/${slug}.md`);
+		let counter = 1;
+		while (
+			newPath !== file.path &&
+			this.app.vault.adapter?.exists &&
+			(await this.app.vault.adapter.exists(newPath))
+		) {
+			newPath = normalizePath(`${targetFolder}/${slug}-${counter}.md`);
+			counter++;
+		}
+
+		const oldPath = file.path;
+		if (newPath !== oldPath) {
+			await this.app.fileManager.renameFile(file, newPath);
+		}
+
+		await this.appendLogEntry(
+			"refactor",
+			`${slug}: filed from ${oldPath} -> /${newPath} (type: ${type})`
+		);
+
+		new Notice(`Lattice: Filed note to /${newPath}`);
+		this.plugin.refreshSidebar();
+		return file;
+	}
+
+	/**
+	 * Checks whether `rawContent` already contains a bundle-relative Markdown link `[...](/path.md)`
+	 * OR a `[[WikiLink]]` to `record`.
 	 */
 	public isConceptLinkedInContent(
 		rawContent: string,
 		record: VectorRecord
 	): boolean {
-		const cleanPath = record.path.replace(/\.md$/i, "");
+		const normPath = record.path.replace(/^\/+/, "");
+		const cleanPath = normPath.replace(/\.md$/i, "");
 		const basename = cleanPath.replace(/^.*\//, "");
-		const candidates = [cleanPath, basename, record.title]
-			.map((s) => s.trim().toLowerCase())
-			.filter(Boolean);
+		const candidates = [
+			normPath.toLowerCase(),
+			"/" + normPath.toLowerCase(),
+			cleanPath.toLowerCase(),
+			"/" + cleanPath.toLowerCase(),
+			basename.toLowerCase(),
+			record.title.trim().toLowerCase(),
+		].filter(Boolean);
 
-		const wikiRegex = /\[\[([^\]|#]+)(?:[|#][^\]]*)?\]\]/g;
+		// 1. Check bundle-relative Markdown links: [label](/path/to/note.md) or [label](path/to/note.md)
+		const mdLinkRegex = /\[[^\]]*\]\(([^)#\s]+)(?:#[^)]*)?\)/g;
 		let match: RegExpExecArray | null;
+		while ((match = mdLinkRegex.exec(rawContent)) !== null) {
+			const rawTarget = decodeURIComponent(match[1].trim()).toLowerCase();
+			const strippedTarget = rawTarget.replace(/^\/+/, "").replace(/\.md$/i, "");
+			if (
+				candidates.includes(rawTarget) ||
+				candidates.includes(strippedTarget)
+			) {
+				return true;
+			}
+		}
+
+		// 2. Check [[WikiLinks]]
+		const wikiRegex = /\[\[([^\]|#]+)(?:[|#][^\]]*)?\]\]/g;
 		while ((match = wikiRegex.exec(rawContent)) !== null) {
-			const target = match[1].trim().replace(/\.md$/i, "").toLowerCase();
+			const target = match[1]
+				.trim()
+				.replace(/^\/+/, "")
+				.replace(/\.md$/i, "")
+				.toLowerCase();
 			if (candidates.includes(target)) {
 				return true;
 			}
@@ -932,44 +1207,42 @@ export class OKFManager {
 	}
 
 	/**
-	 * 1-Click Cross-Linker:
-	 * Connects `record` to `file` with a single click regardless of editor focus or view mode:
-	 * 1. If `record.title` appears as an unlinked mention in the note body, converts it in-place to `[[path|Title]]`.
-	 * 2. Otherwise, appends `record` to the `> [!info] Related Concepts` section at the bottom of `file`
-	 *    (creating the callout block if not present, or adding a line to the existing block).
+	 * Appends a bundle-relative Markdown link `- [Title](/path.md) — description` into `file`
+	 * under `## Related` (matching `meta/templates/note.md`), or inside `> [!info] Related Concepts` if present.
 	 */
-	public async crossLinkConcept(
+	private async appendConceptLinkToFile(
 		file: TFile,
-		record: ScoredVectorRecord | VectorRecord
-	): Promise<boolean> {
-		const rawContent = await this.app.vault.read(file);
-		if (this.isConceptLinkedInContent(rawContent, record)) {
-			new Notice(`Lattice: "${record.title}" is already linked in "${file.basename}".`);
-			return false;
-		}
-
-		const scored: ScoredVectorRecord =
-			"similarity" in record ? record : { ...record, similarity: 1 };
-
-		// 1. Check if there's a natural unlinked mention in the note prose
-		const mentions = this.findUnlinkedMentions(rawContent, [scored]);
-		if (mentions.length > 0) {
-			return await this.convertMentionToWikiLink(file, mentions[0]);
-		}
-
-		// 2. Otherwise, add to the `> [!info] Related Concepts` callout block at the bottom of the note
-		const cleanPath = record.path.replace(/\.md$/i, "");
-		const pct =
-			"similarity" in record
-				? ` (${Math.round(record.similarity * 100)}%)`
-				: "";
+		record: VectorRecord | ScoredVectorRecord
+	): Promise<void> {
+		const normPath = record.path.replace(/^\/+/, "");
+		const mdPath = normPath.endsWith(".md") ? normPath : `${normPath}.md`;
 		const descSuffix = record.description ? ` — ${record.description}` : "";
-		const bulletLine = `> - **[${record.type || "Concept"}]** [[${cleanPath}|${record.title}]]${pct}${descSuffix}`;
+		const mdBullet = `- [${record.title}](/${mdPath})${descSuffix}`;
 
 		await this.app.vault.process(file, (content) => {
+			// If note already has a `## Related` heading, append under it
+			const relatedHeadingRegex = /^##\s+Related\b.*$/m;
+			const headingMatch = relatedHeadingRegex.exec(content);
+			if (headingMatch && headingMatch.index !== undefined) {
+				const afterHeadingIdx =
+					headingMatch.index + headingMatch[0].length;
+				const before = content.slice(0, afterHeadingIdx);
+				const after = content.slice(afterHeadingIdx);
+				// Replace an empty placeholder bullet `- ` if present right below `## Related`
+				if (/^\r?\n-\s*(\r?\n|$)/.test(after)) {
+					return (
+						before +
+						after.replace(/^\r?\n-\s*(\r?\n|$)/, `\n${mdBullet}$1`)
+					);
+				}
+				return `${before}\n${mdBullet}${after}`;
+			}
+
+			// Fallback: if note uses `> [!info] Related Concepts` callout
 			const calloutHeader = "> [!info] Related Concepts";
 			const headerIdx = content.indexOf(calloutHeader);
 			if (headerIdx !== -1) {
+				const calloutBullet = `> - [${record.title}](/${mdPath})${descSuffix}`;
 				const afterHeader = content.slice(headerIdx);
 				const lines = afterHeader.split("\n");
 				let insertLineOffset = 1;
@@ -979,27 +1252,113 @@ export class OKFManager {
 				) {
 					insertLineOffset++;
 				}
-				lines.splice(insertLineOffset, 0, bulletLine);
+				lines.splice(insertLineOffset, 0, calloutBullet);
 				return content.slice(0, headerIdx) + lines.join("\n");
 			}
 
-			return (
-				content.trimEnd() +
-				"\n\n" +
-				calloutHeader +
-				"\n" +
-				bulletLine +
-				"\n"
-			);
+			return `${content.trimEnd()}\n\n## Related\n${mdBullet}\n`;
 		});
+	}
 
-		new Notice(`Lattice: Cross-linked [[${record.title}]] in "${file.basename}".`);
+	/**
+	 * 1-Click Reciprocal Link Helper (`okf_lint.py` ASYMMETRIC fix):
+	 * Adds a bundle-relative link pointing to `sourceFile` inside `targetHubFile`.
+	 */
+	public async addReciprocalLink(
+		sourceFile: TFile,
+		targetHubFile: TFile
+	): Promise<boolean> {
+		const hubContent = await this.app.vault.read(targetHubFile);
+		const sourceVal = this.validateFile(sourceFile);
+		const sourceRecord: VectorRecord = this.plugin?.indexer?.getRecord?.(
+			sourceFile.path
+		) || {
+			path: sourceFile.path,
+			title:
+				typeof sourceVal.frontmatter.title === "string" &&
+				sourceVal.frontmatter.title.trim()
+					? sourceVal.frontmatter.title.trim()
+					: sourceFile.basename,
+			mtime: sourceFile.stat.mtime,
+			type: String(sourceVal.frontmatter.type || "note"),
+			description: String(sourceVal.frontmatter.description || ""),
+			tags: VectorIndexer.normalizeTags(sourceVal.frontmatter.tags),
+			vector: [],
+		};
+
+		if (this.isConceptLinkedInContent(hubContent, sourceRecord)) {
+			return false;
+		}
+
+		await this.appendConceptLinkToFile(targetHubFile, sourceRecord);
+		new Notice(
+			`Lattice: Added reciprocal link to [${sourceRecord.title}](/${sourceFile.path}) in "${targetHubFile.basename}".`
+		);
 		return true;
 	}
 
 	/**
-	 * Inserts `[[path/to/note|Title]]` at the current cursor position in the active or target note's editor.
-	 * Resolves the MarkdownView leaf even when clicking the sidebar stole focus.
+	 * 1-Click Cross-Linker (`meta/okf-spec.md` & `AGENTS.md` Rule #7):
+	 * Connects `record` to `file` with a single click using bundle-relative Markdown links `[Title](/path.md)`:
+	 * 1. If `record.title` appears as an unlinked mention in the note body, converts it in-place to `[Title](/path.md)`.
+	 * 2. Otherwise, appends `- [Title](/path.md) — description` under `## Related`.
+	 * 3. If `record` is a Hub (`topic`, `project`, `org`, `place`, `role`), also adds the reciprocal link on the hub
+	 *    so the graph remains symmetric (`okf_lint.py` ASYMMETRIC rule).
+	 */
+	public async crossLinkConcept(
+		file: TFile,
+		record: ScoredVectorRecord | VectorRecord,
+		addReciprocalIfHub = true
+	): Promise<boolean> {
+		const rawContent = await this.app.vault.read(file);
+		if (this.isConceptLinkedInContent(rawContent, record)) {
+			new Notice(
+				`Lattice: "${record.title}" is already linked in "${file.basename}".`
+			);
+			return false;
+		}
+
+		const scored: ScoredVectorRecord =
+			"similarity" in record ? record : { ...record, similarity: 1 };
+
+		// 1. Check if there's a natural unlinked mention in the note prose
+		const mentions = this.findUnlinkedMentions(rawContent, [scored]);
+		let linked = false;
+		if (mentions.length > 0) {
+			linked = await this.convertMentionToWikiLink(file, mentions[0]);
+		} else {
+			// 2. Otherwise, append under `## Related`
+			await this.appendConceptLinkToFile(file, record);
+			linked = true;
+		}
+
+		// 3. If target is a Hub (topic, project, org, place, role), ensure reciprocal backlink
+		const recType = String(record.type || "").trim().toLowerCase();
+		if (
+			linked &&
+			addReciprocalIfHub &&
+			HUB_OKF_TYPES.has(recType) &&
+			this.app?.vault?.getAbstractFileByPath
+		) {
+			const hubFile = this.app.vault.getAbstractFileByPath(
+				record.path.replace(/^\/+/, "")
+			);
+			if (hubFile instanceof TFile && hubFile.path !== file.path) {
+				await this.addReciprocalLink(file, hubFile);
+			}
+		}
+
+		if (linked && mentions.length === 0) {
+			new Notice(
+				`Lattice: Cross-linked [${record.title}](/${record.path.replace(/^\/+/, "")}) in "${file.basename}".`
+			);
+		}
+		return linked;
+	}
+
+	/**
+	 * Inserts a bundle-relative Markdown link `[Title](/path/to/note.md)` at the current cursor position
+	 * in the active or target note's editor. Resolves the MarkdownView leaf even when clicking the sidebar stole focus.
 	 */
 	public async insertWikiLinkAtCursor(
 		record: VectorRecord,
@@ -1024,10 +1383,11 @@ export class OKFManager {
 		}
 
 		if (activeEditor) {
-			const cleanPath = record.path.replace(/\.md$/i, "");
-			const wikiLink = `[[${cleanPath}|${record.title}]]`;
-			activeEditor.replaceSelection(wikiLink);
-			new Notice(`Lattice: Inserted [[${record.title}]] at cursor.`);
+			const normPath = record.path.replace(/^\/+/, "");
+			const mdPath = normPath.endsWith(".md") ? normPath : `${normPath}.md`;
+			const mdLink = `[${record.title}](/${mdPath})`;
+			activeEditor.replaceSelection(mdLink);
+			new Notice(`Lattice: Inserted ${mdLink} at cursor.`);
 			return true;
 		}
 
@@ -1042,7 +1402,7 @@ export class OKFManager {
 
 	/**
 	 * Command: `Lattice: Insert Related OKF Concepts`
-	 * Appends all unlinked top neighbors into the `> [!info] Related Concepts` callout block.
+	 * Appends all unlinked top neighbors into `## Related` using bundle-relative Markdown links.
 	 */
 	public async appendRelatedCallout(
 		file: TFile,
@@ -1059,7 +1419,9 @@ export class OKFManager {
 		);
 
 		if (unlinkedNeighbors.length === 0) {
-			new Notice("Lattice: All top related concepts are already linked in this note.");
+			new Notice(
+				"Lattice: All top related concepts are already linked in this note."
+			);
 			return;
 		}
 
@@ -1070,7 +1432,7 @@ export class OKFManager {
 
 	/**
 	 * Scans active note prose for unlinked mentions of top semantic neighbors.
-	 * Ignores YAML frontmatter and existing `[[WikiLinks]]`.
+	 * Ignores YAML frontmatter and existing `[...](...)` Markdown links / `[[WikiLinks]]`.
 	 */
 	public findUnlinkedMentions(
 		rawContent: string,
@@ -1079,10 +1441,12 @@ export class OKFManager {
 		const body = VectorIndexer.stripFrontmatter(rawContent);
 		if (!body) return [];
 
-		// Mask out existing [[...]] WikiLinks and markdown links so we don't match inside them
-		const maskedBody = body.replace(/\[\[[^\]]+\]\]/g, (match) =>
-			" ".repeat(match.length)
-		);
+		// Mask out existing [[...]] WikiLinks and [...](...) Markdown links so we don't match inside them
+		const maskedBody = body
+			.replace(/\[\[[^\]]+\]\]/g, (match) => " ".repeat(match.length))
+			.replace(/\[[^\]]*\]\([^)]+\)/g, (match) =>
+				" ".repeat(match.length)
+			);
 
 		const mentions: UnlinkedMention[] = [];
 
@@ -1112,14 +1476,15 @@ export class OKFManager {
 	}
 
 	/**
-	 * Converts the first unlinked mention of `mention.record` in `file` into a `[[WikiLink]]`.
+	 * Converts the first unlinked mention of `mention.record` in `file` into a bundle-relative Markdown link `[text](/path.md)`.
 	 */
 	public async convertMentionToWikiLink(
 		file: TFile,
 		mention: UnlinkedMention
 	): Promise<boolean> {
 		let replaced = false;
-		const cleanPath = mention.record.path.replace(/\.md$/i, "");
+		const normPath = mention.record.path.replace(/^\/+/, "");
+		const mdPath = normPath.endsWith(".md") ? normPath : `${normPath}.md`;
 
 		await this.app.vault.process(file, (rawContent) => {
 			let frontmatterPart = "";
@@ -1136,9 +1501,9 @@ export class OKFManager {
 				}
 			}
 
-			const masked = bodyPart.replace(/\[\[[^\]]+\]\]/g, (m) =>
-				" ".repeat(m.length)
-			);
+			const masked = bodyPart
+				.replace(/\[\[[^\]]+\]\]/g, (m) => " ".repeat(m.length))
+				.replace(/\[[^\]]*\]\([^)]+\)/g, (m) => " ".repeat(m.length));
 			const escaped = mention.matchedText.replace(
 				/[.*+?^${}()|[\]\\]/g,
 				"\\$&"
@@ -1154,10 +1519,10 @@ export class OKFManager {
 				match.index,
 				match.index + match[0].length
 			);
-			const wikiLink = `[[${cleanPath}|${actualText}]]`;
+			const mdLink = `[${actualText}](/${mdPath})`;
 			const updatedBody =
 				bodyPart.slice(0, match.index) +
-				wikiLink +
+				mdLink +
 				bodyPart.slice(match.index + match[0].length);
 
 			replaced = true;
@@ -1166,7 +1531,7 @@ export class OKFManager {
 
 		if (replaced) {
 			new Notice(
-				`Lattice: Linked "${mention.matchedText}" → [[${cleanPath}]]`
+				`Lattice: Linked "${mention.matchedText}" → [/${mdPath}]`
 			);
 		}
 		return replaced;
@@ -1174,7 +1539,7 @@ export class OKFManager {
 
 	/**
 	 * Updates or creates `index.md` at the vault root with a structured OKF catalog
-	 * grouped by discovered `type`.
+	 * grouped by discovered `type` using bundle-relative Markdown links.
 	 */
 	public async updateVaultIndexFile(): Promise<void> {
 		const store = this.plugin.indexer.getStore();
@@ -1210,9 +1575,10 @@ export class OKFManager {
 			lines.push(`## ${type} (${items.length})`);
 			lines.push("");
 			for (const item of items) {
-				const cleanPath = item.path.replace(/\.md$/i, "");
+				const normPath = item.path.replace(/^\/+/, "");
+				const mdPath = normPath.endsWith(".md") ? normPath : `${normPath}.md`;
 				const desc = item.description ? ` — ${item.description}` : "";
-				lines.push(`- [[${cleanPath}|${item.title}]]${desc}`);
+				lines.push(`- [${item.title}](/${mdPath})${desc}`);
 			}
 			lines.push("");
 		}

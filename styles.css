@@ -77,7 +77,96 @@
 	overflow: hidden;
 	text-overflow: ellipsis;
 	white-space: nowrap;
-	max-width: 180px;
+	max-width: 150px;
+}
+
+.lattice-active-note-actions {
+	display: flex;
+	align-items: center;
+	gap: 6px;
+	flex-shrink: 0;
+}
+
+/* Connected Notes Conformance & Vault Conformance Audit */
+.lattice-connected-conformance,
+.lattice-vault-audit-panel {
+	display: flex;
+	flex-direction: column;
+	gap: 6px;
+	padding: 8px 10px;
+	background: var(--background-secondary);
+	border: 1px solid var(--background-modifier-border);
+	border-radius: 6px;
+	font-size: 0.78rem;
+}
+
+.lattice-connected-header {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	gap: 6px;
+}
+
+.lattice-connected-label {
+	font-weight: 600;
+	color: var(--text-muted);
+	font-size: 0.76rem;
+}
+
+.lattice-conformance-list {
+	display: flex;
+	flex-direction: column;
+	gap: 4px;
+	margin-top: 2px;
+	padding-top: 4px;
+	border-top: 1px dashed var(--background-modifier-border);
+	max-height: 210px;
+	overflow-y: auto;
+}
+
+.lattice-conformance-row {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	gap: 6px;
+	padding: 3px 4px;
+	border-radius: 4px;
+	background: var(--background-primary);
+}
+
+.lattice-conformance-row-left {
+	display: flex;
+	align-items: center;
+	gap: 5px;
+	min-width: 0;
+	overflow: hidden;
+}
+
+.lattice-conformance-arrow {
+	color: var(--text-faint);
+	font-family: var(--font-monospace);
+	font-size: 0.74rem;
+	flex-shrink: 0;
+}
+
+.lattice-conformance-missing {
+	font-size: 0.71rem;
+	color: var(--text-faint);
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+.lattice-conformance-unresolved {
+	font-size: 0.72rem;
+	color: var(--color-yellow);
+	padding-top: 4px;
+	border-top: 1px dashed var(--background-modifier-border);
+}
+
+.lattice-conformance-all-ok {
+	font-size: 0.76rem;
+	color: var(--color-green);
 }
 
 /* Filter Bar */
@@ -132,31 +221,38 @@
 	border: 1px solid rgba(156, 163, 175, 0.35);
 }
 
-.lattice-badge-concept {
+.lattice-badge-concept,
+.lattice-badge-note {
 	background: rgba(59, 130, 246, 0.16);
 	color: #60a5fa;
 	border: 1px solid rgba(59, 130, 246, 0.35);
 }
 
-.lattice-badge-spec {
+.lattice-badge-spec,
+.lattice-badge-topic {
 	background: rgba(168, 85, 247, 0.16);
 	color: #c084fc;
 	border: 1px solid rgba(168, 85, 247, 0.35);
 }
 
-.lattice-badge-playbook {
+.lattice-badge-playbook,
+.lattice-badge-project {
 	background: rgba(34, 197, 94, 0.16);
 	color: #4ade80;
 	border: 1px solid rgba(34, 197, 94, 0.35);
 }
 
-.lattice-badge-reference {
+.lattice-badge-reference,
+.lattice-badge-paper,
+.lattice-badge-book,
+.lattice-badge-web {
 	background: rgba(245, 158, 11, 0.16);
 	color: #fbbf24;
 	border: 1px solid rgba(245, 158, 11, 0.35);
 }
 
-.lattice-badge-seed {
+.lattice-badge-seed,
+.lattice-badge-journal {
 	background: rgba(156, 163, 175, 0.16);
 	color: #9ca3af;
 	border: 1px solid rgba(156, 163, 175, 0.35);
@@ -398,4 +494,32 @@
 	justify-content: flex-end;
 	gap: 8px;
 	margin-top: 16px;
+}
+
+/* Ingest Dropzone & File Pickers */
+.lattice-dropzone {
+	border: 2px dashed var(--interactive-accent);
+	border-radius: 8px;
+	padding: 18px 12px;
+	text-align: center;
+	background: var(--background-secondary);
+	cursor: pointer;
+	transition: background-color 0.15s ease, border-color 0.15s ease;
+}
+
+.lattice-dropzone p {
+	margin: 0;
+	color: var(--text-normal);
+	font-size: 0.88rem;
+}
+
+.lattice-dropzone.is-dragover {
+	background: var(--background-modifier-hover);
+	border-color: var(--interactive-success, #22c55e);
+}
+
+.lattice-file-input {
+	padding: 4px;
+	background: var(--background-modifier-form-field);
+	border-radius: 4px;
 }

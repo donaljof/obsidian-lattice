@@ -71,6 +71,24 @@ export class LatticeSidebarView extends ItemView {
 		titleEl.createSpan({ text: "Lattice Discovery" });
 
 		const headerActions = headerTop.createDiv({ cls: "lattice-filter-bar" });
+		const checkVaultBtn = headerActions.createEl("button", {
+			cls: `lattice-btn ${
+				this.showVaultConformancePanel ? "lattice-btn-primary" : ""
+			}`,
+			text: "Check Vault OKF",
+		});
+		checkVaultBtn.setAttr(
+			"title",
+			"Lightweight in-memory OKF conformance scan across all vault notes (<2ms)"
+		);
+		checkVaultBtn.addEventListener("click", () => {
+			this.showVaultConformancePanel = !this.showVaultConformancePanel;
+			if (this.showVaultConformancePanel) {
+				this.plugin.okf.scanVaultOKFConformance(true);
+			}
+			void this.renderView();
+		});
+
 		const syncBtn = headerActions.createEl("button", {
 			cls: "lattice-btn",
 			text: "Sync",
@@ -79,6 +97,10 @@ export class LatticeSidebarView extends ItemView {
 		syncBtn.addEventListener("click", async () => {
 			await this.plugin.indexer.scanVault(false);
 		});
+
+		if (this.showVaultConformancePanel) {
+			this.renderVaultConformancePanel(container);
+		}
 
 		const currentFile = this.app.workspace.getActiveFile();
 		if (currentFile && currentFile.extension.toLowerCase() === "md") {
@@ -100,8 +122,10 @@ export class LatticeSidebarView extends ItemView {
 			return;
 		}
 
-		// 2. Active File OKF Status Bar
-		const validation = this.plugin.okf.validateFile(activeFile);
+		// 2. Active File OKF Status Bar & Post-Change Connected Conformance
+		const connectedReport =
+			this.plugin.okf.verifyNoteAndConnectedConformance(activeFile);
+		const validation = connectedReport.noteValidation;
 		const activeBanner = header.createDiv({ cls: "lattice-active-note" });
 		const activeLeft = activeBanner.createDiv({
 			cls: "lattice-card-title-group",
@@ -119,23 +143,214 @@ export class LatticeSidebarView extends ItemView {
 			text: activeFile.basename,
 		});
 
+		const activeRight = activeBanner.createDiv({
+			cls: "lattice-active-note-actions",
+		});
+
 		if (validation.isValid) {
-			activeBanner.createSpan({
+			const validBadge = activeRight.createSpan({
 				cls: "lattice-badge lattice-badge-valid",
 				text: "OKF Valid",
 			});
-		} else {
-			const enrichBtn = activeBanner.createEl("button", {
-				cls: "lattice-btn lattice-btn-primary",
-				text: "Enrich OKF",
-			});
-			enrichBtn.setAttr(
+			validBadge.setAttr(
 				"title",
-				`Missing OKF fields: ${validation.missingFields.join(", ")}`
+				"All required OKF frontmatter headers are present and valid."
 			);
-			enrichBtn.addEventListener("click", async () => {
-				await this.plugin.okf.enrichNoteFrontmatter(activeFile, false);
+		} else {
+			const issues = [
+				validation.missingFields.length > 0
+					? `Missing: ${validation.missingFields.join(", ")}`
+					: "",
+				...validation.warnings,
+			]
+				.filter(Boolean)
+				.join(" | ");
+			const invalidBadge = activeRight.createSpan({
+				cls: "lattice-badge lattice-badge-invalid",
+				text: "Incomplete",
 			});
+			invalidBadge.setAttr("title", issues || "Incomplete OKF headers");
+		}
+
+		// Always keep "Enrich OKF" available both post new-note creation AND later in the lifecycle when content changes
+		const enrichBtn = activeRight.createEl("button", {
+			cls: validation.isValid
+				? "lattice-btn"
+				: "lattice-btn lattice-btn-primary",
+			text: "Enrich OKF",
+		});
+		enrichBtn.setAttr(
+			"title",
+			validation.isValid
+				? "Re-analyze note content to update OKF headers and verify connected notes"
+				: `Generate OKF headers from note content (missing: ${validation.missingFields.join(", ")})`
+		);
+		enrichBtn.addEventListener("click", async () => {
+			await this.plugin.okf.enrichNoteFrontmatter(activeFile, true);
+		});
+
+		// If the active note is in `inbox/`, offer 1-click `okf-refactor` filing to its canonical type folder
+		if (this.plugin.okf.isNoteInInbox(activeFile)) {
+			const targetFolder = this.plugin.okf.getTargetFolderForType(
+				validation.frontmatter.type
+			);
+			const fileBtn = activeRight.createEl("button", {
+				cls: "lattice-btn lattice-btn-primary",
+				text: `File → ${targetFolder}/`,
+			});
+			fileBtn.setAttr(
+				"title",
+				`Move from inbox/ to /${targetFolder}/ with lowercase kebab-case slug and log to log.md`
+			);
+			fileBtn.addEventListener("click", async () => {
+				if (!validation.isValid) {
+					await this.plugin.okf.enrichNoteFrontmatter(activeFile, true);
+				}
+				await this.plugin.okf.fileNoteFromInbox(activeFile);
+			});
+		}
+
+		// 2b. Connected Notes OKF Conformance & Asymmetric Hub Strip
+		if (
+			connectedReport.connectedNotes.length > 0 ||
+			connectedReport.unresolvedLinks.length > 0
+		) {
+			const connBox = header.createDiv({ cls: "lattice-connected-conformance" });
+			const connHeader = connBox.createDiv({
+				cls: "lattice-connected-header",
+			});
+
+			const totalConn = connectedReport.connectedNotes.length;
+			const validConn = connectedReport.validConnectedCount;
+			const issueCount =
+				connectedReport.invalidConnectedNotes.length +
+				connectedReport.asymmetricHubNotes.length +
+				connectedReport.unresolvedLinks.length;
+			const allLinksValid = issueCount === 0;
+
+			connHeader.createSpan({
+				cls: "lattice-connected-label",
+				text: `Connected Notes: ${validConn}/${totalConn} OKF Valid`,
+			});
+
+			connHeader.createSpan({
+				cls: `lattice-badge ${
+					allLinksValid ? "lattice-badge-valid" : "lattice-badge-invalid"
+				}`,
+				text: allLinksValid
+					? "Links Conformant"
+					: `${issueCount} Issue(s)`,
+			});
+
+			if (
+				connectedReport.invalidConnectedNotes.length > 0 ||
+				connectedReport.asymmetricHubNotes.length > 0
+			) {
+				const invalidList = connBox.createDiv({
+					cls: "lattice-conformance-list",
+				});
+
+				for (const item of connectedReport.invalidConnectedNotes) {
+					const row = invalidList.createDiv({
+						cls: "lattice-conformance-row",
+					});
+					const left = row.createDiv({
+						cls: "lattice-conformance-row-left",
+					});
+					const arrow =
+						item.direction === "both"
+							? "↔"
+							: item.direction === "outgoing"
+							? "→"
+							: "←";
+					left.createSpan({
+						cls: "lattice-conformance-arrow",
+						text: arrow,
+					});
+					const linkEl = left.createSpan({
+						cls: "lattice-card-title",
+						text: item.file.basename,
+					});
+					linkEl.setAttr("title", `Open ${item.file.path}`);
+					linkEl.addEventListener("click", async () => {
+						await this.app.workspace.getLeaf(false).openFile(item.file);
+					});
+
+					const missingText =
+						item.validation.missingFields.length > 0
+							? `missing: ${item.validation.missingFields.join(", ")}`
+							: item.validation.warnings[0] || "non-standard";
+					left.createSpan({
+						cls: "lattice-conformance-missing",
+						text: `(${missingText})`,
+					});
+
+					const fixBtn = row.createEl("button", {
+						cls: "lattice-btn lattice-btn-primary",
+						text: "Enrich",
+					});
+					fixBtn.setAttr(
+						"title",
+						`Enrich OKF headers for connected note "${item.file.basename}"`
+					);
+					fixBtn.addEventListener("click", async () => {
+						await this.plugin.okf.enrichNoteFrontmatter(item.file, true);
+						await this.renderView();
+					});
+				}
+
+				for (const item of connectedReport.asymmetricHubNotes) {
+					const row = invalidList.createDiv({
+						cls: "lattice-conformance-row",
+					});
+					const left = row.createDiv({
+						cls: "lattice-conformance-row-left",
+					});
+					left.createSpan({
+						cls: "lattice-conformance-arrow",
+						text: "→",
+					});
+					const linkEl = left.createSpan({
+						cls: "lattice-card-title",
+						text: item.file.basename,
+					});
+					linkEl.setAttr("title", `Open hub ${item.file.path}`);
+					linkEl.addEventListener("click", async () => {
+						await this.app.workspace.getLeaf(false).openFile(item.file);
+					});
+					left.createSpan({
+						cls: "lattice-conformance-missing",
+						text: "(hub does not link back)",
+					});
+
+					const backlinkBtn = row.createEl("button", {
+						cls: "lattice-btn lattice-btn-primary",
+						text: "+ Link Back",
+					});
+					backlinkBtn.setAttr(
+						"title",
+						`Add reciprocal link to "${activeFile.basename}" inside hub "${item.file.basename}"`
+					);
+					backlinkBtn.addEventListener("click", async () => {
+						await this.plugin.okf.addReciprocalLink(
+							activeFile,
+							item.file
+						);
+						await this.renderView();
+					});
+				}
+			}
+
+			if (connectedReport.unresolvedLinks.length > 0) {
+				const unresolvedEl = connBox.createDiv({
+					cls: "lattice-conformance-unresolved",
+					text: `Unwritten concept links: ${connectedReport.unresolvedLinks.join(", ")}`,
+				});
+				unresolvedEl.setAttr(
+					"title",
+					"Advisory: these outgoing links point to concepts not yet written."
+				);
+			}
 		}
 
 		// 3. OKF Type Filter Bar
@@ -202,6 +417,10 @@ export class LatticeSidebarView extends ItemView {
 				filterType: this.activeTypeFilter,
 				topK: this.plugin.settings.topK,
 				threshold: this.plugin.settings.similarityThreshold,
+				headerBoostWeight: this.plugin.settings.headerBoostWeight ?? 0.15,
+				queryTitle: activeRecord.title,
+				queryDescription: activeRecord.description,
+				queryTags: activeRecord.tags,
 			}
 		);
 
@@ -379,13 +598,15 @@ export class LatticeSidebarView extends ItemView {
 		});
 
 		// Secondary: Insert at Cursor (preserves editor focus via mousedown preventDefault)
+		const normPath = neighbor.path.replace(/^\/+/, "");
+		const mdPath = normPath.endsWith(".md") ? normPath : `${normPath}.md`;
 		const cursorBtn = actions.createEl("button", {
 			cls: "lattice-btn",
 			text: "@ Cursor",
 		});
 		cursorBtn.setAttr(
 			"title",
-			`Insert [[${neighbor.path.replace(/\.md$/i, "")}|${neighbor.title}]] at current editor cursor`
+			`Insert [${neighbor.title}](/${mdPath}) at current editor cursor`
 		);
 		cursorBtn.addEventListener("mousedown", (e) => {
 			// Prevent sidebar click from stealing focus from the Markdown editor cursor
@@ -401,9 +622,189 @@ export class LatticeSidebarView extends ItemView {
 			text: "Copy",
 		});
 		copyBtn.addEventListener("click", async () => {
-			const cleanPath = neighbor.path.replace(/\.md$/i, "");
-			await navigator.clipboard.writeText(`[[${cleanPath}|${neighbor.title}]]`);
-			new Notice(`Copied [[${cleanPath}|${neighbor.title}]]`);
+			await navigator.clipboard.writeText(`[${neighbor.title}](/${mdPath})`);
+			new Notice(`Copied [${neighbor.title}](/${mdPath})`);
 		});
+	}
+
+	/**
+	 * Renders the ultra-lightweight full-vault OKF conformance & graph lint audit panel (<2ms in-memory check).
+	 */
+	private renderVaultConformancePanel(container: HTMLElement): void {
+		const summary = this.plugin.okf.scanVaultOKFConformance(false);
+		const panel = container.createDiv({ cls: "lattice-vault-audit-panel" });
+
+		const headerRow = panel.createDiv({ cls: "lattice-connected-header" });
+		headerRow.createSpan({
+			cls: "lattice-connected-label",
+			text: `Vault OKF Conformance: ${summary.validCount}/${summary.totalNotes} Valid (${summary.durationMs}ms)`,
+		});
+
+		const headerRight = headerRow.createDiv({
+			cls: "lattice-active-note-actions",
+		});
+		headerRight.createSpan({
+			cls: `lattice-badge ${
+				summary.invalidCount === 0
+					? "lattice-badge-valid"
+					: "lattice-badge-invalid"
+			}`,
+			text:
+				summary.invalidCount === 0
+					? "PASS"
+					: `${summary.invalidCount} Error(s)`,
+		});
+
+		const closeBtn = headerRight.createEl("button", {
+			cls: "lattice-btn",
+			text: "×",
+		});
+		closeBtn.setAttr("title", "Hide vault conformance report");
+		closeBtn.addEventListener("click", () => {
+			this.showVaultConformancePanel = false;
+			void this.renderView();
+		});
+
+		// Advisory Graph Lint Summary (Inbox, Orphans, Asymmetric Hub Links)
+		const metaStats = [
+			summary.inboxNotes.length > 0
+				? `Inbox staging: ${summary.inboxNotes.length}`
+				: "",
+			summary.asymmetricLinks.length > 0
+				? `Asymmetric hub links: ${summary.asymmetricLinks.length}`
+				: "",
+			summary.orphanNotes.length > 0
+				? `Orphans: ${summary.orphanNotes.length}`
+				: "",
+		].filter(Boolean);
+
+		if (metaStats.length > 0) {
+			panel.createDiv({
+				cls: "lattice-conformance-missing",
+				text: metaStats.join(" • "),
+			});
+		}
+
+		if (
+			summary.invalidCount === 0 &&
+			summary.inboxNotes.length === 0 &&
+			summary.asymmetricLinks.length === 0
+		) {
+			panel.createDiv({
+				cls: "lattice-conformance-all-ok",
+				text: "✓ Every concept in the vault conforms to OKF v0.1.",
+			});
+			return;
+		}
+
+		const listEl = panel.createDiv({ cls: "lattice-conformance-list" });
+		const maxVisible = 25;
+
+		// 1. Non-conformant concepts (ERRORS)
+		for (const item of summary.invalidNotes.slice(0, maxVisible)) {
+			const row = listEl.createDiv({ cls: "lattice-conformance-row" });
+			const left = row.createDiv({ cls: "lattice-conformance-row-left" });
+
+			const linkEl = left.createSpan({
+				cls: "lattice-card-title",
+				text: item.file.basename,
+			});
+			linkEl.setAttr("title", `Open ${item.file.path}`);
+			linkEl.addEventListener("click", async () => {
+				await this.app.workspace.getLeaf(false).openFile(item.file);
+			});
+
+			const missingText =
+				item.validation.missingFields.length > 0
+					? `missing: ${item.validation.missingFields.join(", ")}`
+					: item.validation.warnings[0] || "non-standard";
+			left.createSpan({
+				cls: "lattice-conformance-missing",
+				text: `(${missingText})`,
+			});
+
+			const enrichBtn = row.createEl("button", {
+				cls: "lattice-btn lattice-btn-primary",
+				text: "Enrich",
+			});
+			enrichBtn.setAttr(
+				"title",
+				`Enrich OKF frontmatter for "${item.file.basename}"`
+			);
+			enrichBtn.addEventListener("click", async () => {
+				await this.plugin.okf.enrichNoteFrontmatter(item.file, true);
+				await this.renderView();
+			});
+		}
+
+		// 2. Un-normalized inbox/ notes (ADVISORY)
+		for (const item of summary.inboxNotes.slice(0, 10)) {
+			const row = listEl.createDiv({ cls: "lattice-conformance-row" });
+			const left = row.createDiv({ cls: "lattice-conformance-row-left" });
+			left.createSpan({
+				cls: "lattice-conformance-arrow",
+				text: "[inbox]",
+			});
+			const linkEl = left.createSpan({
+				cls: "lattice-card-title",
+				text: item.file.basename,
+			});
+			linkEl.setAttr("title", `Open ${item.file.path}`);
+			linkEl.addEventListener("click", async () => {
+				await this.app.workspace.getLeaf(false).openFile(item.file);
+			});
+
+			const enrichBtn = row.createEl("button", {
+				cls: "lattice-btn",
+				text: "Refactor",
+			});
+			enrichBtn.setAttr(
+				"title",
+				`Enrich OKF headers and file "${item.file.basename}" from inbox/`
+			);
+			enrichBtn.addEventListener("click", async () => {
+				const ok = await this.plugin.okf.enrichNoteFrontmatter(
+					item.file,
+					true
+				);
+				if (ok) {
+					await this.plugin.okf.fileNoteFromInbox(item.file);
+				}
+				await this.renderView();
+			});
+		}
+
+		// 3. Asymmetric hub links (okf_lint.py ASYMMETRIC)
+		for (const pair of summary.asymmetricLinks.slice(0, 10)) {
+			const row = listEl.createDiv({ cls: "lattice-conformance-row" });
+			const left = row.createDiv({ cls: "lattice-conformance-row-left" });
+			const linkEl = left.createSpan({
+				cls: "lattice-card-title",
+				text: `${pair.sourceFile.basename} → ${pair.hubFile.basename}`,
+			});
+			linkEl.setAttr("title", `Hub "${pair.hubFile.path}" does not link back`);
+			linkEl.addEventListener("click", async () => {
+				await this.app.workspace.getLeaf(false).openFile(pair.hubFile);
+			});
+
+			const fixBtn = row.createEl("button", {
+				cls: "lattice-btn",
+				text: "+ Link Back",
+			});
+			fixBtn.addEventListener("click", async () => {
+				await this.plugin.okf.addReciprocalLink(
+					pair.sourceFile,
+					pair.hubFile
+				);
+				await this.renderView();
+			});
+		}
+
+		if (summary.invalidNotes.length > maxVisible) {
+			panel.createDiv({
+				cls: "lattice-conformance-missing",
+				text: `+ ${summary.invalidNotes.length - maxVisible} more incomplete note(s)...`,
+			});
+		}
 	}
 }

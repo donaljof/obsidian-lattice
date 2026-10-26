@@ -1,6 +1,6 @@
 import { Notice, Plugin, TFile, WorkspaceLeaf } from "obsidian";
 import { VectorIndexer } from "./indexer";
-import { UrlIngestModal } from "./ingest";
+import { LatticeIngestModal, UrlIngestModal } from "./ingest";
 import { findRelatedConcepts } from "./math";
 import { OKFManager } from "./okf";
 import {
@@ -73,15 +73,15 @@ export default class LatticePlugin extends Plugin {
 	}
 
 	private registerLatticeCommands(): void {
-		// 1. Enrich OKF Frontmatter on Active Note
+		// 1. Enrich / Update OKF Frontmatter on Active Note
 		this.addCommand({
 			id: "enrich-okf-frontmatter",
-			name: "Enrich OKF Frontmatter",
+			name: "Enrich OKF Frontmatter (Add or Update Headers & Verify Connected Notes)",
 			checkCallback: (checking: boolean) => {
 				const activeFile = this.app.workspace.getActiveFile();
 				if (activeFile && activeFile.extension.toLowerCase() === "md") {
 					if (!checking) {
-						void this.okf.enrichNoteFrontmatter(activeFile, false);
+						void this.okf.enrichNoteFrontmatter(activeFile, true);
 					}
 					return true;
 				}
@@ -89,7 +89,16 @@ export default class LatticePlugin extends Plugin {
 			},
 		});
 
-		// 2. Insert Related OKF Concepts Callout
+		// 2. Scan All Notes & Check OKF Conformance (Lightweight <2ms in-memory check)
+		this.addCommand({
+			id: "check-vault-okf-conformance",
+			name: "Scan All Notes & Check OKF Conformance",
+			callback: async () => {
+				await this.activateSidebarView(true);
+			},
+		});
+
+		// 3. Insert Related OKF Concepts Callout
 		this.addCommand({
 			id: "insert-related-okf-concepts",
 			name: "Insert Related OKF Concepts",
@@ -102,6 +111,15 @@ export default class LatticePlugin extends Plugin {
 					return true;
 				}
 				return false;
+			},
+		});
+
+		// Ingest Source or Topic (File, Folder, URL)
+		this.addCommand({
+			id: "ingest-source-or-topic",
+			name: "Ingest Source or Topic (File, Folder, URL)",
+			callback: () => {
+				new LatticeIngestModal(this.app, this).open();
 			},
 		});
 
@@ -191,12 +209,19 @@ export default class LatticePlugin extends Plugin {
 			})
 		);
 
-		// Metadata cache updates invalidate schema discovery cache and refresh the sidebar OKF badge immediately
+		// Post-header-change hook: invalidate discovery cache, verify OKF conformance of the note + connected notes, and refresh sidebar
 		this.registerEvent(
 			this.app.metadataCache.on("changed", (file) => {
 				this.okf.invalidateDiscoveryCache();
+				const report = this.okf.verifyNoteAndConnectedConformance(file);
 				const active = this.app.workspace.getActiveFile();
-				if (active && active.path === file.path) {
+				if (
+					active &&
+					(active.path === file.path ||
+						report.connectedNotes.some(
+							(c) => c.file.path === active.path
+						))
+				) {
 					this.refreshSidebar();
 				}
 			})
@@ -227,15 +252,20 @@ export default class LatticePlugin extends Plugin {
 			this.indexer.getStore(),
 			{
 				excludePath: file.path,
-				topK: this.settings.topK,
+				topK: Math.min(3, this.settings.topK),
 				threshold: this.settings.similarityThreshold,
+				headerBoostWeight: this.settings.headerBoostWeight ?? 0.15,
+				queryTitle: record.title,
+				queryDescription: record.description,
+				queryTags: record.tags,
+				strictAutoLink: true,
 			}
 		);
 
 		await this.okf.appendRelatedCallout(file, neighbors);
 	}
 
-	public async activateSidebarView(): Promise<void> {
+	public async activateSidebarView(openVaultAudit = false): Promise<void> {
 		const { workspace } = this.app;
 		let leaf: WorkspaceLeaf | null = null;
 		const leaves = workspace.getLeavesOfType(VIEW_TYPE_LATTICE);
@@ -254,6 +284,9 @@ export default class LatticePlugin extends Plugin {
 
 		if (leaf) {
 			await workspace.revealLeaf(leaf);
+			if (openVaultAudit && leaf.view instanceof LatticeSidebarView) {
+				leaf.view.openVaultConformancePanel();
+			}
 		}
 	}
 

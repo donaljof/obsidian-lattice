@@ -1,16 +1,17 @@
 import { App, Notice, PluginSettingTab, Setting } from "obsidian";
 import type LatticePlugin from "./main";
 
-export type OKFType = "Concept" | "Spec" | "Playbook" | "Reference" | "Seed";
-export type OKFStatus = "seed" | "growing" | "evergreen";
+export type OKFType = "note" | "paper" | "topic" | "project";
+export type AIProvider = "ollama" | "cloud" | "auto";
+export type CloudProvider = "gemini" | "anthropic" | "openai";
 
 export interface OKFFrontmatter {
 	type?: OKFType | string;
 	title?: string;
 	description?: string;
+	resource?: string;
 	tags?: string[] | string;
-	created?: string;
-	status?: OKFStatus | string;
+	timestamp?: string;
 	[key: string]: unknown;
 }
 
@@ -32,11 +33,19 @@ export interface LatticeSettings {
 	ollamaUrl: string;
 	embeddingModel: string;
 	chatModel: string;
+	aiProvider: AIProvider;
+	cloudProvider: CloudProvider;
+	cloudApiKey: string;
+	cloudModel: string;
+	cloudBaseUrl: string;
+	customCloudRoot: string;
 	excludedFolders: string[];
 	excludedFiles: string[];
 	inboxFolder: string;
+	typeFolderMap: Record<string, string>;
 	topK: number;
 	similarityThreshold: number;
+	headerBoostWeight: number;
 	debounceMs: number;
 	exportSharedVectors: boolean;
 	sharedVectorsPath: string;
@@ -47,11 +56,47 @@ export const DEFAULT_SETTINGS: LatticeSettings = {
 	ollamaUrl: "http://localhost:11434",
 	embeddingModel: "nomic-embed-text",
 	chatModel: "llama3.2",
-	excludedFolders: [".obsidian", ".git", ".okf", "templates", "node_modules"],
-	excludedFiles: ["index.md", "log.md", "CLAUDE.md"],
-	inboxFolder: "00_Inbox",
-	topK: 7,
+	aiProvider: "auto",
+	cloudProvider: "gemini",
+	cloudApiKey: "",
+	cloudModel: "gemini-2.5-flash",
+	cloudBaseUrl: "",
+	customCloudRoot: "",
+	excludedFolders: [
+		".obsidian",
+		".git",
+		".okf",
+		".claude",
+		".agents",
+		".opencode",
+		".copilot",
+		"copilot",
+		"meta",
+		".trash",
+		"templates",
+		"node_modules",
+		"__pycache__",
+	],
+	excludedFiles: [
+		"index.md",
+		"log.md",
+		"README.md",
+		"CLAUDE.md",
+		"AGENTS.md",
+		"GEMINI.md",
+		"VAULT.md",
+		"tasks.md",
+	],
+	inboxFolder: "inbox",
+	typeFolderMap: {
+		note: "notes",
+		paper: "sources/literature",
+		topic: "topics",
+		project: "projects",
+	},
+	topK: 5,
 	similarityThreshold: 0.35,
+	headerBoostWeight: 0.15,
 	debounceMs: 2000,
 	exportSharedVectors: true,
 	sharedVectorsPath: ".okf/vectors.json",
@@ -153,7 +198,7 @@ export class LatticeSettingTab extends PluginSettingTab {
 
 		new Setting(containerEl)
 			.setName("Minimum Similarity Threshold")
-			.setDesc("Minimum cosine similarity score (0.0 to 1.0) required to surface a related concept.")
+			.setDesc("Minimum centered similarity score (0.1 to 0.9) required to surface a related concept.")
 			.addSlider((slider) =>
 				slider
 					.setLimits(0.1, 0.9, 0.05)
@@ -161,6 +206,23 @@ export class LatticeSettingTab extends PluginSettingTab {
 					.setDynamicTooltip()
 					.onChange(async (value) => {
 						this.plugin.settings.similarityThreshold = value;
+						await this.plugin.savePluginData();
+						this.plugin.refreshSidebar();
+					})
+			);
+
+		new Setting(containerEl)
+			.setName("OKF Header & Tag Boost Weight")
+			.setDesc(
+				"Soft boost weight (0.00 to 0.40) for matching OKF tags, title, and description. Gated by semantic similarity so incorrect tags cannot force false matches (0 = off)."
+			)
+			.addSlider((slider) =>
+				slider
+					.setLimits(0.0, 0.4, 0.02)
+					.setValue(this.plugin.settings.headerBoostWeight ?? 0.15)
+					.setDynamicTooltip()
+					.onChange(async (value) => {
+						this.plugin.settings.headerBoostWeight = value;
 						await this.plugin.savePluginData();
 						this.plugin.refreshSidebar();
 					})
@@ -266,17 +328,18 @@ export class LatticeSettingTab extends PluginSettingTab {
 		containerEl.createEl("h3", { text: "Vault Discovery & Consistency" });
 
 		const report = this.plugin.okf.getLastDiscoveryReport();
-		const discoveredTypes = this.plugin.okf.getDiscoveredTypes();
-		const discoveredStatuses = this.plugin.okf.getDiscoveredStatuses();
+		const typeFolderMap = this.plugin.okf.getTypeFolderMap();
+		const mapPairs = Object.entries(typeFolderMap)
+			.map(([t, f]) => `${t} → ${f}/`)
+			.join(", ");
 
 		const summaryLines = report
 			? [
 					`Notes Indexed: ${report.indexedNotes} / ${report.totalIndexableNotes} (${report.validOkfNotes} OKF-complete)`,
 					`Vector Dimension: ${report.primaryVectorDimension ? `${report.primaryVectorDimension}D` : "None cached"}`,
-					`Discovered Types: ${discoveredTypes.join(", ")}`,
-					`Discovered Statuses: ${discoveredStatuses.join(", ")}`,
+					`Type Routing: ${mapPairs}`,
 			  ].join(" • ")
-			: `Discovered Types: ${discoveredTypes.join(", ")}`;
+			: `Type Routing: ${mapPairs}`;
 
 		new Setting(containerEl)
 			.setName("Discovered Vault Schema & Health")
@@ -287,6 +350,78 @@ export class LatticeSettingTab extends PluginSettingTab {
 					.onClick(async () => {
 						await this.plugin.okf.runStartupDiscovery(true);
 						this.display();
+					})
+			);
+
+		// --- Knowledge Loader & AI Synthesis Configuration ---
+		containerEl.createEl("h3", { text: "Knowledge Loader & AI Synthesis" });
+
+		new Setting(containerEl)
+			.setName("AI Model Provider")
+			.setDesc("Choose whether to synthesize notes via local Ollama, Cloud API, or Auto (Ollama first with Cloud fallback).")
+			.addDropdown((dropdown) =>
+				dropdown
+					.addOption("auto", "Auto (Local Ollama with Cloud Fallback)")
+					.addOption("ollama", "Local Ollama Only")
+					.addOption("cloud", "Cloud API Only")
+					.setValue(this.plugin.settings.aiProvider || "auto")
+					.onChange(async (val) => {
+						this.plugin.settings.aiProvider = val as AIProvider;
+						await this.plugin.savePluginData();
+					})
+			);
+
+		new Setting(containerEl)
+			.setName("Cloud AI Provider")
+			.setDesc("Select the cloud API provider to use for synthesis.")
+			.addDropdown((dropdown) =>
+				dropdown
+					.addOption("gemini", "Google Gemini")
+					.addOption("anthropic", "Anthropic Claude")
+					.addOption("openai", "OpenAI / Compatible")
+					.setValue(this.plugin.settings.cloudProvider || "gemini")
+					.onChange(async (val) => {
+						this.plugin.settings.cloudProvider = val as CloudProvider;
+						await this.plugin.savePluginData();
+					})
+			);
+
+		new Setting(containerEl)
+			.setName("Cloud API Key")
+			.setDesc("API key for Google Gemini, Anthropic, or OpenAI.")
+			.addText((text) =>
+				text
+					.setPlaceholder("Enter API Key")
+					.setValue(this.plugin.settings.cloudApiKey || "")
+					.onChange(async (val) => {
+						this.plugin.settings.cloudApiKey = val.trim();
+						await this.plugin.savePluginData();
+					})
+			);
+
+		new Setting(containerEl)
+			.setName("Cloud Model Name")
+			.setDesc("e.g. gemini-2.5-flash, claude-3-5-sonnet-20241022, or gpt-4o-mini.")
+			.addText((text) =>
+				text
+					.setPlaceholder("gemini-2.5-flash")
+					.setValue(this.plugin.settings.cloudModel || "gemini-2.5-flash")
+					.onChange(async (val) => {
+						this.plugin.settings.cloudModel = val.trim();
+						await this.plugin.savePluginData();
+					})
+			);
+
+		new Setting(containerEl)
+			.setName("Google Drive / Cloud Root Path")
+			.setDesc("Optional anchor folder (e.g. 'C:/Users/donal/My Drive'). Used to compute portable gdrive:// URIs across machines.")
+			.addText((text) =>
+				text
+					.setPlaceholder("C:/Users/.../My Drive")
+					.setValue(this.plugin.settings.customCloudRoot || "")
+					.onChange(async (val) => {
+						this.plugin.settings.customCloudRoot = val.trim();
+						await this.plugin.savePluginData();
 					})
 			);
 	}

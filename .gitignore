@@ -2,6 +2,7 @@ node_modules/
 main.js
 *.js.map
 .test-dist/
+scripts/.test-bundle.mjs
 data.json
 vectors.json
 .DS_Store

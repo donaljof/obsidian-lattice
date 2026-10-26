@@ -125,14 +125,17 @@ export class VectorIndexer {
 				: "";
 		const tags = VectorIndexer.normalizeTags(frontmatter?.tags);
 
+		const headerSummary = description ? `${title} — ${description}` : title;
 		const composite = [
-			`Type: ${type}`,
-			`Title: ${file.basename}`,
-			`Description: ${description}`,
-			`Tags: ${tags.join(", ")}`,
+			`Title: ${title}`,
+			description ? `Description: ${description}` : "",
 			"",
-			noteBody.slice(0, 6000),
-		].join("\n");
+			headerSummary,
+			"",
+			noteBody.slice(0, 4000),
+		]
+			.filter((line, idx, arr) => line !== "" || (idx > 0 && arr[idx - 1] !== ""))
+			.join("\n");
 
 		return { composite, type, title, description, tags };
 	}
