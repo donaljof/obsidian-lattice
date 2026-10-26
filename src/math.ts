@@ -13,6 +13,7 @@ export interface NeighborQueryOptions {
 	queryTags?: string[];
 	strictAutoLink?: boolean;
 	disableCentering?: boolean;
+	storeVersion?: number;
 }
 
 interface CentroidCacheEntry {
@@ -20,12 +21,19 @@ interface CentroidCacheEntry {
 	dim: number;
 	samplePath: string;
 	sampleMtime: number;
+	storeVersion?: number;
 	centroid: number[];
 	centroidNormSq: number;
 	tagDocFreq: Map<string, number>;
 }
 
 const centroidCache = new WeakMap<object, CentroidCacheEntry>();
+
+export function invalidateCentroidCache(store?: object): void {
+	if (store) {
+		centroidCache.delete(store);
+	}
+}
 
 const IGNORED_META_TAGS = new Set([
 	"inbox",
@@ -161,20 +169,25 @@ export function extractHeaderTokens(title?: string, description?: string): Set<s
 function getOrComputeCorpusStats(
 	store: Record<string, VectorRecord>,
 	records: VectorRecord[],
-	targetDim: number
+	targetDim: number,
+	storeVersion?: number
 ): CentroidCacheEntry | null {
 	if (records.length < 10) return null;
 
 	const firstRec = records[0];
 	const cached = centroidCache.get(store);
-	if (
-		cached &&
-		cached.count === records.length &&
-		cached.dim === targetDim &&
-		cached.samplePath === firstRec.path &&
-		cached.sampleMtime === firstRec.mtime
-	) {
-		return cached;
+	if (cached && cached.dim === targetDim) {
+		if (storeVersion !== undefined) {
+			if (cached.storeVersion === storeVersion) {
+				return cached;
+			}
+		} else if (
+			cached.count === records.length &&
+			cached.samplePath === firstRec.path &&
+			cached.sampleMtime === firstRec.mtime
+		) {
+			return cached;
+		}
 	}
 
 	const centroid = new Array<number>(targetDim).fill(0);
@@ -222,6 +235,7 @@ function getOrComputeCorpusStats(
 		dim: targetDim,
 		samplePath: firstRec.path,
 		sampleMtime: firstRec.mtime,
+		storeVersion,
 		centroid,
 		centroidNormSq,
 		tagDocFreq,
@@ -269,7 +283,7 @@ export function findRelatedConcepts(
 	const qRawTags = options.queryTags ?? selfRecord?.tags ?? [];
 
 	const stats = !disableCentering
-		? getOrComputeCorpusStats(store, records, targetDim)
+		? getOrComputeCorpusStats(store, records, targetDim, options.storeVersion)
 		: null;
 
 	// If corpus stats are available and corpus exhibits anisotropy (||centroid||^2 > 0.02),

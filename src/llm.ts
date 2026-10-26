@@ -132,6 +132,18 @@ function buildSynthesisPrompt(req: OKFSynthesisRequest, discoveredTypes: string[
 	].join("\n");
 }
 
+function requestUrlWithTimeout(
+	params: Parameters<typeof requestUrl>[0],
+	timeoutMs = 60000
+): ReturnType<typeof requestUrl> {
+	return Promise.race([
+		requestUrl(params),
+		new Promise<never>((_, reject) =>
+			setTimeout(() => reject(new Error(`LLM request timed out after ${timeoutMs}ms`)), timeoutMs)
+		),
+	]) as ReturnType<typeof requestUrl>;
+}
+
 async function callOllama(
 	prompt: string,
 	settings: LatticeSettings,
@@ -146,13 +158,13 @@ async function callOllama(
 		bodyPayload.format = "json";
 	}
 
-	const res = await requestUrl({
+	const res = await requestUrlWithTimeout({
 		url: `${settings.ollamaUrl}/api/generate`,
 		method: "POST",
 		headers: { "Content-Type": "application/json" },
 		body: JSON.stringify(bodyPayload),
 		throw: false,
-	});
+	}, 60000);
 
 	if (res.status === 200 && res.json?.response) {
 		return res.json.response;
@@ -176,13 +188,13 @@ async function callCloudProvider(
 		if (formatJson) {
 			bodyPayload.generationConfig = { responseMimeType: "application/json" };
 		}
-		const res = await requestUrl({
+		const res = await requestUrlWithTimeout({
 			url,
 			method: "POST",
 			headers: { "Content-Type": "application/json" },
 			body: JSON.stringify(bodyPayload),
 			throw: false,
-		});
+		}, 60000);
 
 		if (res.status === 200 && res.json?.candidates?.[0]?.content?.parts?.[0]?.text) {
 			return res.json.candidates[0].content.parts[0].text;
@@ -190,6 +202,7 @@ async function callCloudProvider(
 	} else if (provider === "openai") {
 		const model = settings.cloudModel || "gpt-4o-mini";
 		const baseUrl = settings.cloudBaseUrl || "https://api.openai.com/v1";
+		const url = `${baseUrl}/chat/completions`;
 		const bodyPayload: Record<string, unknown> = {
 			model,
 			messages: [{ role: "user", content: prompt }],
@@ -197,8 +210,8 @@ async function callCloudProvider(
 		if (formatJson) {
 			bodyPayload.response_format = { type: "json_object" };
 		}
-		const res = await requestUrl({
-			url: `${baseUrl}/chat/completions`,
+		const res = await requestUrlWithTimeout({
+			url,
 			method: "POST",
 			headers: {
 				"Content-Type": "application/json",
@@ -206,14 +219,14 @@ async function callCloudProvider(
 			},
 			body: JSON.stringify(bodyPayload),
 			throw: false,
-		});
+		}, 60000);
 
 		if (res.status === 200 && res.json?.choices?.[0]?.message?.content) {
 			return res.json.choices[0].message.content;
 		}
 	} else if (provider === "anthropic") {
 		const model = settings.cloudModel || "claude-3-5-sonnet-20241022";
-		const res = await requestUrl({
+		const res = await requestUrlWithTimeout({
 			url: "https://api.anthropic.com/v1/messages",
 			method: "POST",
 			headers: {
@@ -227,7 +240,7 @@ async function callCloudProvider(
 				messages: [{ role: "user", content: prompt }],
 			}),
 			throw: false,
-		});
+		}, 60000);
 
 		if (res.status === 200 && res.json?.content?.[0]?.text) {
 			return res.json.content[0].text;

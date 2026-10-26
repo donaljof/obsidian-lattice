@@ -78,6 +78,10 @@ export class LatticeIngestModal extends Modal {
 			const files = (e.target as HTMLInputElement).files;
 			if (files && files.length > 0) {
 				const file = files[0];
+				if (file.size > 50 * 1024 * 1024) {
+					new Notice("Lattice: File exceeds 50MB maximum size limit.");
+					return;
+				}
 				this.pendingFileName = file.name;
 				this.pathOrUrlInput = (file as unknown as { path?: string }).path || file.name;
 				pathInputEl.value = this.pathOrUrlInput;
@@ -103,6 +107,10 @@ export class LatticeIngestModal extends Modal {
 			const dt = e.dataTransfer;
 			if (dt && dt.files && dt.files.length > 0) {
 				const file = dt.files[0];
+				if (file.size > 50 * 1024 * 1024) {
+					new Notice("Lattice: File exceeds 50MB maximum size limit.");
+					return;
+				}
 				this.pendingFileName = file.name;
 				this.pathOrUrlInput = (file as unknown as { path?: string }).path || file.name;
 				pathInputEl.value = this.pathOrUrlInput;
@@ -186,6 +194,7 @@ export class LatticeIngestModal extends Modal {
 					buffer: this.pendingBuffer || undefined,
 					filename: this.pendingFileName || undefined,
 				});
+				this.pendingBuffer = null;
 
 				this.close();
 				if (createdFiles && createdFiles.length > 0) {

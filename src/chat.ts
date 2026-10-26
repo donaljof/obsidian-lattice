@@ -44,12 +44,6 @@ export interface HeaderGraphMapResult {
 	activeNoteSnippet?: string;
 }
 
-export interface WikiTraversalResult {
-	nodes: TraversedWikiNode[];
-	primaryTopicHubPath?: string;
-	formattedContext: string;
-}
-
 export interface ChatStepPill {
 	icon: "map" | "read" | "edit" | "synthesize";
 	label: string;
@@ -76,8 +70,8 @@ export interface DiffLine {
 }
 
 /**
- * Computes a clean line-by-line Longest Common Subsequence (LCS) diff
- * between `originalText` and `proposedText` for the pop-up approval modal.
+ * Computes a clean line-by-line Myers diff between `originalText` and `proposedText`
+ * for the pop-up approval modal with linear memory footprint.
  */
 export function computeLineDiff(
 	originalText: string,
@@ -97,12 +91,13 @@ export function computeLineDiff(
 	const m = oldLines.length;
 	const n = newLines.length;
 
-	// Guard against very large files (>800 lines) with prefix/suffix trimming
+	// 1. Fast prefix trimming
 	let start = 0;
 	while (start < m && start < n && oldLines[start] === newLines[start]) {
 		start++;
 	}
 
+	// 2. Fast suffix trimming
 	let endOld = m - 1;
 	let endNew = n - 1;
 	while (
@@ -130,80 +125,109 @@ export function computeLineDiff(
 	const midN = midNew.length;
 
 	const midDiff: DiffLine[] = [];
+	const maxD = midM + midN;
 
-	if (midM * midN <= 250000) {
-		const dp: Uint16Array[] = Array.from(
-			{ length: midM + 1 },
-			() => new Uint16Array(midN + 1)
-		);
-		for (let i = midM - 1; i >= 0; i--) {
-			for (let j = midN - 1; j >= 0; j--) {
-				if (midOld[i] === midNew[j]) {
-					dp[i][j] = dp[i + 1][j + 1] + 1;
+	if (maxD === 0) {
+		// Middle is identical
+	} else if (maxD > 4000) {
+		// Graceful fallback for exceptionally huge diffs (>4000 mid lines)
+		for (let i = 0; i < midM; i++) {
+			midDiff.push({ type: "remove", text: midOld[i], oldLine: start + i + 1 });
+		}
+		for (let j = 0; j < midN; j++) {
+			midDiff.push({ type: "add", text: midNew[j], newLine: start + j + 1 });
+		}
+	} else {
+		// Myers O((N+M)D) linear-space shortest edit script
+		const vOffset = maxD;
+		const v = new Int32Array(2 * maxD + 1);
+		v[vOffset + 1] = 0;
+		const trace: Int32Array[] = [];
+
+		let reachedEnd = false;
+		for (let d = 0; d <= maxD; d++) {
+			trace.push(new Int32Array(v));
+			for (let k = -d; k <= d; k += 2) {
+				let x: number;
+				if (k === -d || (k !== d && v[vOffset + k - 1] < v[vOffset + k + 1])) {
+					x = v[vOffset + k + 1];
 				} else {
-					dp[i][j] = Math.max(dp[i + 1][j], dp[i][j + 1]);
+					x = v[vOffset + k - 1] + 1;
+				}
+				let y = x - k;
+				while (x < midM && y < midN && midOld[x] === midNew[y]) {
+					x++;
+					y++;
+				}
+				v[vOffset + k] = x;
+				if (x >= midM && y >= midN) {
+					reachedEnd = true;
+					break;
+				}
+			}
+			if (reachedEnd) break;
+		}
+
+		// Backtrack through trace to build exact edit path
+		let x = midM;
+		let y = midN;
+		const editPath: Array<{ type: "same" | "add" | "remove"; oldIdx: number; newIdx: number }> = [];
+
+		for (let d = trace.length - 1; d > 0; d--) {
+			const k = x - y;
+			const prevV = trace[d];
+			let prevK: number;
+			if (k === -d || (k !== d && prevV[vOffset + k - 1] < prevV[vOffset + k + 1])) {
+				prevK = k + 1;
+			} else {
+				prevK = k - 1;
+			}
+			const prevX = prevV[vOffset + prevK];
+			const prevY = prevX - prevK;
+
+			while (x > prevX && y > prevY) {
+				x--;
+				y--;
+				editPath.push({ type: "same", oldIdx: x, newIdx: y });
+			}
+			if (d > 0) {
+				if (x === prevX) {
+					y--;
+					editPath.push({ type: "add", oldIdx: x, newIdx: y });
+				} else {
+					x--;
+					editPath.push({ type: "remove", oldIdx: x, newIdx: y });
 				}
 			}
 		}
+		while (x > 0 && y > 0) {
+			x--;
+			y--;
+			editPath.push({ type: "same", oldIdx: x, newIdx: y });
+		}
+		editPath.reverse();
 
-		let i = 0;
-		let j = 0;
-		while (i < midM && j < midN) {
-			if (midOld[i] === midNew[j]) {
+		for (const step of editPath) {
+			if (step.type === "same") {
 				midDiff.push({
 					type: "same",
-					text: midOld[i],
-					oldLine: start + i + 1,
-					newLine: start + j + 1,
+					text: midOld[step.oldIdx],
+					oldLine: start + step.oldIdx + 1,
+					newLine: start + step.newIdx + 1,
 				});
-				i++;
-				j++;
-			} else if (dp[i + 1][j] >= dp[i][j + 1]) {
+			} else if (step.type === "remove") {
 				midDiff.push({
 					type: "remove",
-					text: midOld[i],
-					oldLine: start + i + 1,
+					text: midOld[step.oldIdx],
+					oldLine: start + step.oldIdx + 1,
 				});
-				i++;
 			} else {
 				midDiff.push({
 					type: "add",
-					text: midNew[j],
-					newLine: start + j + 1,
+					text: midNew[step.newIdx],
+					newLine: start + step.newIdx + 1,
 				});
-				j++;
 			}
-		}
-		while (i < midM) {
-			midDiff.push({
-				type: "remove",
-				text: midOld[i],
-				oldLine: start + i + 1,
-			});
-			i++;
-		}
-		while (j < midN) {
-			midDiff.push({
-				type: "add",
-				text: midNew[j],
-				newLine: start + j + 1,
-			});
-			j++;
-		}
-	} else {
-		for (let i = 0; i < midM; i++) {
-			midDiff.push({
-				type: "remove",
-				text: midOld[i],
-				oldLine: start + i + 1,
-			});
-		}
-		for (let j = 0; j < midN; j++) {
-			midDiff.push({
-				type: "add",
-				text: midNew[j],
-				newLine: start + j + 1,
-			});
 		}
 	}
 
@@ -632,311 +656,7 @@ export class VaultWikiTraverser {
 		};
 	}
 
-	public async traverseForQuery(
-		userPrompt: string,
-		activeFile: TFile | null,
-		scope: ChatScopeMode = "wiki-active"
-	): Promise<WikiTraversalResult> {
-		const visited = new Map<string, TraversedWikiNode>();
-		const allFiles = this.app.vault?.getMarkdownFiles?.() || [];
-		const fileByPath = new Map<string, TFile>();
-		const fileByBasename = new Map<string, TFile>();
 
-		for (const f of allFiles) {
-			if (this.plugin.indexer && !this.plugin.indexer.shouldIndexFile(f)) {
-				continue;
-			}
-			const norm = f.path.replace(/^\/+/, "");
-			fileByPath.set(norm.toLowerCase(), f);
-			fileByBasename.set(f.basename.toLowerCase(), f);
-		}
-
-		const queryTokens = extractHeaderTokens(userPrompt, "");
-		const resolvedLinks: Record<string, Record<string, number>> =
-			(this.app.metadataCache as unknown as {
-				resolvedLinks?: Record<string, Record<string, number>>;
-			})?.resolvedLinks || {};
-
-		const resolveFile = (ref: string): TFile | null => {
-			const clean = ref.replace(/^\/+/, "").toLowerCase();
-			const withMd = clean.endsWith(".md") ? clean : `${clean}.md`;
-			if (fileByPath.has(withMd)) return fileByPath.get(withMd)!;
-			const base = clean.replace(/^.*\//, "").replace(/\.md$/i, "");
-			return fileByBasename.get(base) || null;
-		};
-
-		const readNodeMeta = (file: TFile) => {
-			const rec = this.plugin.indexer?.getRecord?.(file.path);
-			const cache = this.app.metadataCache?.getFileCache?.(file);
-			const fm = cache?.frontmatter || {};
-			return {
-				title:
-					rec?.title ||
-					(typeof fm.title === "string" && fm.title.trim()
-						? fm.title.trim()
-						: file.basename),
-				type:
-					rec?.type ||
-					(typeof fm.type === "string" && fm.type.trim()
-						? fm.type.trim()
-						: "note"),
-				description:
-					rec?.description ||
-					(typeof fm.description === "string" ? fm.description.trim() : ""),
-				tags: rec?.tags || VectorIndexer.normalizeTags(fm.tags),
-			};
-		};
-
-		const scoreHeaderMatch = (file: TFile): number => {
-			if (queryTokens.size === 0) return 0;
-			const meta = readNodeMeta(file);
-			const nodeTokens = extractHeaderTokens(
-				`${meta.title} ${file.basename}`,
-				`${meta.description} ${meta.tags.join(" ")}`
-			);
-			let hits = 0;
-			for (const qt of queryTokens) {
-				if (nodeTokens.has(qt)) {
-					hits += 1;
-				} else {
-					for (const nt of nodeTokens) {
-						if (nt.includes(qt) || qt.includes(nt)) {
-							hits += 0.5;
-							break;
-						}
-					}
-				}
-			}
-			return hits / Math.sqrt(queryTokens.size);
-		};
-
-		const addNode = async (
-			file: TFile,
-			provenance: TraversalProvenance,
-			viaPath?: string,
-			maxChars = 2800
-		): Promise<void> => {
-			const norm = file.path.replace(/^\/+/, "");
-			if (visited.has(norm)) return;
-			const meta = readNodeMeta(file);
-			const raw = await this.readFileSafe(file);
-			const body = VectorIndexer.stripFrontmatter(raw);
-			visited.set(norm, {
-				path: norm,
-				title: meta.title,
-				type: meta.type,
-				description: meta.description,
-				tags: meta.tags,
-				provenance,
-				viaPath,
-				contentSnippet: body.slice(0, maxChars),
-			});
-		};
-
-		// ============================================================================
-		// STAGE 1: Anchor Resolution (Active Note + Explicit Prompt Links + Topic Hubs)
-		// ============================================================================
-		const anchorFiles: TFile[] = [];
-		if (activeFile && scope !== "wiki-global") {
-			await addNode(activeFile, "anchor", undefined, 3600);
-			anchorFiles.push(activeFile);
-		}
-
-		// Explicit [[WikiLinks]] or /path.md mentions inside the user prompt
-		const promptRefs = extractExplicitLinksFromMarkdown(userPrompt);
-		for (const ref of promptRefs) {
-			const target = resolveFile(ref);
-			if (target) {
-				await addNode(target, "anchor", "prompt-mention", 3200);
-				if (!anchorFiles.includes(target)) anchorFiles.push(target);
-			}
-		}
-
-		if (scope === "active-only" && visited.size > 0) {
-			return this.formatResult(visited);
-		}
-
-		// Match Topic Hubs (`topics/*.md`) and Project Hubs (`projects/*.md`) via OKF headers
-		const hubFiles = allFiles.filter((f) => {
-			const p = f.path.replace(/^\/+/, "").toLowerCase();
-			const meta = readNodeMeta(f);
-			return (
-				p.startsWith("topics/") ||
-				p.startsWith("projects/") ||
-				meta.type.toLowerCase() === "topic" ||
-				meta.type.toLowerCase() === "project"
-			);
-		});
-
-		const scoredHubs = hubFiles
-			.map((f) => ({ file: f, score: scoreHeaderMatch(f) }))
-			.filter((x) => x.score >= 0.45)
-			.sort((a, b) => b.score - a.score);
-
-		for (const h of scoredHubs.slice(0, 2)) {
-			await addNode(h.file, "topic-hub", "okf-header-index", 3000);
-		}
-
-		// ============================================================================
-		// STAGE 2: Explicit 1-Hop & 2-Hop Wiki Graph Traversal
-		// ============================================================================
-		const getConnectedFiles = async (sourceFile: TFile): Promise<TFile[]> => {
-			const connected = new Map<string, TFile>();
-			const srcNorm = sourceFile.path.replace(/^\/+/, "");
-
-			// 2a. Outgoing links from metadataCache.resolvedLinks
-			const outMap =
-				resolvedLinks[sourceFile.path] || resolvedLinks["/" + srcNorm] || {};
-			for (const [tgtPath, count] of Object.entries(outMap)) {
-				if (count > 0) {
-					const tf = resolveFile(tgtPath);
-					if (tf && tf.path !== sourceFile.path) {
-						connected.set(tf.path, tf);
-					}
-				}
-			}
-
-			// 2b. Incoming backlinks from metadataCache.resolvedLinks (crucial for finding parent Topic Hubs!)
-			for (const [otherSrc, targets] of Object.entries(resolvedLinks)) {
-				if (!targets) continue;
-				if ((targets[srcNorm] || targets["/" + srcNorm] || 0) > 0) {
-					const tf = resolveFile(otherSrc);
-					if (tf && tf.path !== sourceFile.path) {
-						connected.set(tf.path, tf);
-					}
-				}
-			}
-
-			// 2c. Direct Markdown link extraction (handles bundle-relative `/sources/...` links even if cache is cold)
-			const raw = await this.readFileSafe(sourceFile);
-			for (const ref of extractExplicitLinksFromMarkdown(raw)) {
-				const tf = resolveFile(ref);
-				if (tf && tf.path !== sourceFile.path) {
-					connected.set(tf.path, tf);
-				}
-			}
-
-			return Array.from(connected.values());
-		};
-
-		// Traverse 1-hop neighbors of all Anchor notes
-		for (const anchor of anchorFiles) {
-			const hop1Files = await getConnectedFiles(anchor);
-
-			// Prioritize Topic Hubs and Project Hubs linked to/from the anchor note
-			const hop1Hubs: TFile[] = [];
-			const hop1Concepts: Array<{ file: TFile; score: number }> = [];
-
-			for (const cand of hop1Files) {
-				const meta = readNodeMeta(cand);
-				const isHub =
-					cand.path.startsWith("topics/") ||
-					cand.path.startsWith("projects/") ||
-					meta.type.toLowerCase() === "topic" ||
-					meta.type.toLowerCase() === "project";
-				if (isHub && cand.basename.toLowerCase() !== "overview") {
-					hop1Hubs.push(cand);
-				} else if (cand.basename.toLowerCase() !== "overview") {
-					hop1Concepts.push({
-						file: cand,
-						score: scoreHeaderMatch(cand) + 0.1,
-					});
-				}
-			}
-
-			for (const hub of hop1Hubs.slice(0, 2)) {
-				await addNode(hub, "topic-hub", anchor.path, 3000);
-			}
-
-			hop1Concepts.sort((a, b) => b.score - a.score);
-			for (const item of hop1Concepts.slice(0, 3)) {
-				await addNode(item.file, "graph-1hop", anchor.path, 2200);
-			}
-		}
-
-		// 2-Hop Traversal: Expand outgoing links from discovered Topic Hubs first, then 1-hop graph nodes
-		const discoveredHubNodes = Array.from(visited.values()).filter(
-			(n) => n.provenance === "topic-hub" || n.provenance === "graph-1hop"
-		);
-
-		for (const hubNode of discoveredHubNodes) {
-			const hubFile = resolveFile(hubNode.path);
-			if (!hubFile) continue;
-			const hop2Files = await getConnectedFiles(hubFile);
-			const rankedHop2 = hop2Files
-				.filter(
-					(f) =>
-						!visited.has(f.path.replace(/^\/+/, "")) &&
-						f.basename.toLowerCase() !== "overview"
-				)
-				.map((f) => ({ file: f, score: scoreHeaderMatch(f) }))
-				.filter((x) => x.score > 0 || visited.size < 4)
-				.sort((a, b) => b.score - a.score);
-
-			for (const item of rankedHop2.slice(0, 3)) {
-				await addNode(item.file, "graph-2hop", hubNode.path, 2000);
-				if (visited.size >= 7) break;
-			}
-		}
-
-		// If no specific Topic Hub or Anchor matched yet (e.g. general vault question), include `/topics/overview.md`
-		if (visited.size === 0) {
-			const overviewFile = resolveFile("topics/overview.md");
-			if (overviewFile) {
-				await addNode(overviewFile, "topic-hub", "moc-root", 3000);
-			}
-		}
-
-		// ============================================================================
-		// STAGE 3: Option 3 Vector Fallback (Strictly for Unlinked Bridges)
-		// ============================================================================
-		const explicitGraphCount = Array.from(visited.values()).filter(
-			(n) => n.provenance !== "anchor"
-		).length;
-
-		// Only consult vectors if explicit graph links are sparse (<3) or to surface at most 1-2 high-confidence unlinked bridges
-		const maxVectorBridges = explicitGraphCount < 2 ? 3 : 1;
-		const store = this.plugin.indexer?.getStore?.() || {};
-
-		if (Object.keys(store).length > 0 && maxVectorBridges > 0) {
-			let queryVec: number[] | null = null;
-			if (this.plugin.indexer?.fetchEmbedding) {
-				queryVec = await this.plugin.indexer.fetchEmbedding(userPrompt);
-			}
-			if (!queryVec && activeFile) {
-				queryVec = this.plugin.indexer.getRecord(activeFile.path)?.vector || null;
-			}
-
-			if (queryVec && queryVec.length > 0) {
-				const activeRec = activeFile
-					? this.plugin.indexer.getRecord(activeFile.path)
-					: undefined;
-				const vecMatches = findRelatedConcepts(queryVec, store, {
-					excludePath: activeFile?.path,
-					topK: 6,
-					threshold: this.plugin.settings.similarityThreshold,
-					headerBoostWeight: this.plugin.settings.headerBoostWeight ?? 0.15,
-					queryTitle: userPrompt,
-					queryDescription: activeRec?.description,
-					queryTags: activeRec?.tags,
-					strictAutoLink: explicitGraphCount >= 2,
-				});
-
-				let addedBridges = 0;
-				for (const match of vecMatches) {
-					const norm = match.path.replace(/^\/+/, "");
-					if (visited.has(norm)) continue;
-					const tf = resolveFile(norm);
-					if (!tf) continue;
-					await addNode(tf, "unlinked-bridge", "vector-fallback", 2000);
-					addedBridges++;
-					if (addedBridges >= maxVectorBridges) break;
-				}
-			}
-		}
-
-		return this.formatResult(visited);
-	}
 
 	private async readFileSafe(file: TFile): Promise<string> {
 		try {
@@ -947,47 +667,6 @@ export class VaultWikiTraverser {
 		} catch {
 			return "";
 		}
-	}
-
-	private formatResult(visited: Map<string, TraversedWikiNode>): WikiTraversalResult {
-		const nodes = Array.from(visited.values());
-		const hubNode = nodes.find(
-			(n) =>
-				n.provenance === "topic-hub" &&
-				n.path.toLowerCase() !== "topics/overview.md"
-		);
-
-		const sections: string[] = [];
-		for (const node of nodes) {
-			const provLabel =
-				node.provenance === "anchor"
-					? "ANCHOR NOTE"
-					: node.provenance === "topic-hub"
-					? "TOPIC HUB (Curated Domain Map)"
-					: node.provenance === "graph-1hop"
-					? `1-HOP EXPLICIT LINK (via /${node.viaPath})`
-					: node.provenance === "graph-2hop"
-					? `2-HOP HUB CONCEPT (via /${node.viaPath})`
-					: "UNLINKED VECTOR BRIDGE (Implicit Match)";
-
-			sections.push(
-				[
-					`--- [${provLabel}] /${node.path} ---`,
-					`Title: ${node.title} | Type: ${node.type} | Tags: [${node.tags.join(", ")}]`,
-					node.description ? `Description: ${node.description}` : "",
-					"Content:",
-					node.contentSnippet,
-				]
-					.filter(Boolean)
-					.join("\n")
-			);
-		}
-
-		return {
-			nodes,
-			primaryTopicHubPath: hubNode?.path,
-			formattedContext: sections.join("\n\n"),
-		};
 	}
 }
 

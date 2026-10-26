@@ -1,7 +1,19 @@
 import { App, Notice, TAbstractFile, TFile, normalizePath, requestUrl } from "obsidian";
 import type LatticePlugin from "./main";
-import { normalizeVector } from "./math";
+import { invalidateCentroidCache, normalizeVector } from "./math";
 import type { OKFFrontmatter, VectorRecord } from "./settings";
+
+function requestUrlWithTimeout(
+	params: Parameters<typeof requestUrl>[0],
+	timeoutMs = 15000
+): ReturnType<typeof requestUrl> {
+	return Promise.race([
+		requestUrl(params),
+		new Promise<never>((_, reject) =>
+			setTimeout(() => reject(new Error(`Request timed out after ${timeoutMs}ms`)), timeoutMs)
+		),
+	]) as ReturnType<typeof requestUrl>;
+}
 
 export class VectorIndexer {
 	private app: App;
@@ -11,11 +23,17 @@ export class VectorIndexer {
 	private saveTimer: ReturnType<typeof setTimeout> | null = null;
 	public isOllamaOnline = false;
 	public isIndexing = false;
+	public storeVersion = 0;
 
 	constructor(app: App, plugin: LatticePlugin, initialVectors: Record<string, VectorRecord> = {}) {
 		this.app = app;
 		this.plugin = plugin;
 		this.store = initialVectors || {};
+	}
+
+	public markStoreMutated(): void {
+		this.storeVersion++;
+		invalidateCentroidCache(this.store);
 	}
 
 	public getStore(): Record<string, VectorRecord> {
@@ -145,11 +163,11 @@ export class VectorIndexer {
 	 */
 	public async checkOllamaStatus(forceNotice = false): Promise<boolean> {
 		try {
-			const response = await requestUrl({
+			const response = await requestUrlWithTimeout({
 				url: `${this.plugin.settings.ollamaUrl}/api/tags`,
 				method: "GET",
 				throw: false,
-			});
+			}, 10000);
 			this.isOllamaOnline = response.status >= 200 && response.status < 300;
 		} catch {
 			this.isOllamaOnline = false;
@@ -176,7 +194,7 @@ export class VectorIndexer {
 
 		try {
 			// Primary Ollama /api/embed endpoint
-			const res = await requestUrl({
+			const res = await requestUrlWithTimeout({
 				url: `${baseUrl}/api/embed`,
 				method: "POST",
 				headers: { "Content-Type": "application/json" },
@@ -185,7 +203,7 @@ export class VectorIndexer {
 					input: text,
 				}),
 				throw: false,
-			});
+			}, 15000);
 
 			if (res.status === 200 && res.json) {
 				this.isOllamaOnline = true;
@@ -211,7 +229,7 @@ export class VectorIndexer {
 
 			// Fallback to legacy /api/embeddings if /api/embed endpoint itself is not found
 			if (res.status === 404) {
-				const legacyRes = await requestUrl({
+				const legacyRes = await requestUrlWithTimeout({
 					url: `${baseUrl}/api/embeddings`,
 					method: "POST",
 					headers: { "Content-Type": "application/json" },
@@ -220,7 +238,7 @@ export class VectorIndexer {
 						prompt: text,
 					}),
 					throw: false,
-				});
+				}, 15000);
 				if (legacyRes.status === 200 && legacyRes.json && Array.isArray(legacyRes.json.embedding)) {
 					this.isOllamaOnline = true;
 					return normalizeVector(legacyRes.json.embedding);
@@ -287,6 +305,7 @@ export class VectorIndexer {
 
 		if (this.store[file.path]) {
 			delete this.store[file.path];
+			this.markStoreMutated();
 			this.scheduleSave();
 			this.plugin.refreshSidebar();
 		}
@@ -308,7 +327,10 @@ export class VectorIndexer {
 		}
 
 		if (!this.shouldIndexFile(file)) {
-			this.scheduleSave();
+			if (oldRecord) {
+				this.markStoreMutated();
+				this.scheduleSave();
+			}
 			return;
 		}
 
@@ -321,6 +343,7 @@ export class VectorIndexer {
 						? file.basename
 						: oldRecord.title,
 			};
+			this.markStoreMutated();
 			this.scheduleSave();
 		}
 
@@ -351,6 +374,7 @@ export class VectorIndexer {
 			) {
 				if (this.store[file.path]) {
 					delete this.store[file.path];
+					this.markStoreMutated();
 					this.scheduleSave();
 				}
 				return null;
@@ -377,6 +401,7 @@ export class VectorIndexer {
 			};
 
 			this.store[file.path] = record;
+			this.markStoreMutated();
 			this.scheduleSave();
 			this.plugin.updateStatusBar();
 
@@ -416,6 +441,7 @@ export class VectorIndexer {
 		try {
 			if (forceRebuild) {
 				this.store = {};
+				this.markStoreMutated();
 			}
 
 			const allFiles = this.app.vault.getMarkdownFiles();
@@ -443,6 +469,7 @@ export class VectorIndexer {
 			for (const path of Object.keys(this.store)) {
 				if (!validPaths.has(path)) {
 					delete this.store[path];
+					this.markStoreMutated();
 					pruned++;
 				}
 			}
@@ -492,6 +519,7 @@ export class VectorIndexer {
 									path,
 									vector: normalizeVector(rec.vector),
 								};
+								this.markStoreMutated();
 								importedCount++;
 							}
 						}
@@ -517,7 +545,7 @@ export class VectorIndexer {
 		this.saveTimer = setTimeout(async () => {
 			this.saveTimer = null;
 			await this.flushSave();
-		}, 1500);
+		}, 4000);
 	}
 
 	public async flushSave(): Promise<void> {
@@ -542,7 +570,7 @@ export class VectorIndexer {
 					await adapter.mkdir(dir);
 				}
 			}
-			await adapter.write(sharedPath, JSON.stringify(this.store, null, 2));
+			await adapter.write(sharedPath, JSON.stringify(this.store));
 		} catch (err) {
 			console.error("Lattice: Failed writing shared vectors file", err);
 		}

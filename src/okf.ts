@@ -1,6 +1,7 @@
 import { App, Editor, MarkdownView, Notice, TFile, normalizePath, requestUrl } from "obsidian";
 import { VectorIndexer } from "./indexer";
 import type LatticePlugin from "./main";
+import { toKebabSlug } from "./path-utils";
 import type {
 	OKFFrontmatter,
 	OKFType,
@@ -816,13 +817,7 @@ export class OKFManager {
 	 * Converts a concept title into a lowercase kebab-case slug per `meta/okf-spec.md`.
 	 */
 	public static toKebabSlug(raw: string): string {
-		return raw
-			.toLowerCase()
-			.replace(/['’]/g, "")
-			.replace(/[^a-z0-9]+/g, "-")
-			.replace(/-+/g, "-")
-			.replace(/^-|-$/g, "")
-			.slice(0, 80);
+		return toKebabSlug(raw);
 	}
 
 	/**

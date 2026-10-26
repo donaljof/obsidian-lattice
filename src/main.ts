@@ -219,20 +219,25 @@ export default class LatticePlugin extends Plugin {
 		);
 
 		// Post-header-change hook: invalidate discovery cache, verify OKF conformance of the note + connected notes, and refresh sidebar
+		let metadataChangedTimer: ReturnType<typeof setTimeout> | null = null;
 		this.registerEvent(
 			this.app.metadataCache.on("changed", (file) => {
-				this.okf.invalidateDiscoveryCache();
-				const report = this.okf.verifyNoteAndConnectedConformance(file);
-				const active = this.app.workspace.getActiveFile();
-				if (
-					active &&
-					(active.path === file.path ||
-						report.connectedNotes.some(
-							(c) => c.file.path === active.path
-						))
-				) {
-					this.refreshSidebar();
-				}
+				if (metadataChangedTimer) clearTimeout(metadataChangedTimer);
+				metadataChangedTimer = setTimeout(() => {
+					metadataChangedTimer = null;
+					this.okf.invalidateDiscoveryCache();
+					const report = this.okf.verifyNoteAndConnectedConformance(file);
+					const active = this.app.workspace.getActiveFile();
+					if (
+						active &&
+						(active.path === file.path ||
+							report.connectedNotes.some(
+								(c) => c.file.path === active.path
+							))
+					) {
+						this.refreshSidebar();
+					}
+				}, 400);
 			})
 		);
 

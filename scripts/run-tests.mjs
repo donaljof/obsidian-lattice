@@ -890,7 +890,7 @@ This paper is not yet linked in the explicit graph but shares high semantic/tag 
 	};
 
 	const traverser = new VaultWikiTraverser(mockChatApp, mockChatPlugin);
-	const traversal = await traverser.traverseForQuery(
+	const traversal = await traverser.traverseHeaderGraph(
 		"Summarize predictive maintenance bearing faults and RUL",
 		fileMap.get("topics/applied-ai/ai-predictive-maintenance.md"),
 		"wiki-active"
