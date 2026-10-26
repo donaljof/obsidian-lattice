@@ -1,0 +1,10 @@
+{
+	"id": "lattice",
+	"name": "Lattice",
+	"version": "1.0.0",
+	"minAppVersion": "1.4.0",
+	"description": "Open Knowledge Format (OKF) enforcer with local vector indexing via Ollama, ambient semantic discovery, 1-click WikiLink cross-linking, and URL clipping.",
+	"author": "Lattice Contributors",
+	"authorUrl": "https://github.com/obsidian-lattice",
+	"isDesktopOnly": true
+}

@@ -1,0 +1,32 @@
+{
+  "name": "obsidian-lattice",
+  "version": "1.0.0",
+  "description": "Open Knowledge Format (OKF) enforcer with local vector indexing via Ollama and ambient semantic discovery for Obsidian.",
+  "main": "main.js",
+  "type": "module",
+  "scripts": {
+    "dev": "node esbuild.config.mjs",
+    "build": "tsc --noEmit && node esbuild.config.mjs production",
+    "typecheck": "tsc --noEmit",
+    "test": "node scripts/run-tests.mjs"
+  },
+  "keywords": [
+    "obsidian",
+    "obsidian-plugin",
+    "lattice",
+    "ollama",
+    "embeddings",
+    "okf"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "@mozilla/readability": "^0.6.0"
+  },
+  "devDependencies": {
+    "@types/node": "^25.8.0",
+    "esbuild": "^0.28.2",
+    "obsidian": "^1.12.4",
+    "typescript": "^6.0.3",
+    "yaml": "^2.9.0"
+  }
+}
