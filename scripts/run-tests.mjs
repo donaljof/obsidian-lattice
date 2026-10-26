@@ -14,6 +14,8 @@ const buildResult = await esbuild.build({
 			export * from "./src/extractors/pptx.ts";
 			export * from "./src/extractors/docx.ts";
 			export * from "./src/extractors/pdf.ts";
+			export * from "./src/llm.ts";
+			export * from "./src/chat.ts";
 		`,
 		resolveDir: process.cwd(),
 		loader: "ts",
@@ -35,6 +37,11 @@ const buildResult = await esbuild.build({
 					contents: `
 						export class TAbstractFile {}
 						export class MarkdownView {}
+						export class Modal {
+							constructor(app) { this.app = app; }
+							open() {}
+							close() {}
+						}
 						export class TFile extends TAbstractFile {
 							constructor(path) {
 								super();
@@ -77,6 +84,12 @@ const {
 	extractPdf,
 	extractDocx,
 	extractDocument,
+	computeLineDiff,
+	extractExplicitLinksFromMarkdown,
+	VaultWikiTraverser,
+	buildSynthesisNoteProposal,
+	parseVaultChatResponse,
+	applyProposedPatchToContent,
 } = mod;
 
 console.log("=== Running Lattice (obsidian-lattice) Unit & Benchmark Tests ===");
@@ -660,6 +673,395 @@ In functional analysis, a Vector Lattice is studied alongside [Eigenvalues and E
 		"Increasing headerBoostWeight should boost semantically valid matches with matching OKF headers/tags"
 	);
 	console.log("✔ Hybrid Matching (Option 3): Corpus mean-centering, configurable headerBoostWeight slider, and corrupted-tag immunity verified.");
+}
+
+// 10. OKF Graph-Traversal-First Chat Engine, Line Diff, & Proposed Note Approval Flow
+{
+	// 10.1 Line-by-line LCS diff verification
+	const oldNote = [
+		"---",
+		"type: note",
+		"title: POM Catalysis",
+		"---",
+		"",
+		"Initial summary of polyoxometalate catalysis.",
+		"Legacy line to remove.",
+	].join("\n");
+
+	const newNote = [
+		"---",
+		"type: note",
+		"title: POM Catalysis",
+		"---",
+		"",
+		"Initial summary of polyoxometalate catalysis.",
+		"Added section on electron-transfer kinetics with [Polyoxometalates](/topics/materials-science/polyoxometalates.md).",
+	].join("\n");
+
+	const diff = computeLineDiff(oldNote, newNote);
+	const addedLines = diff.filter((d) => d.type === "add");
+	const removedLines = diff.filter((d) => d.type === "remove");
+	const sameLines = diff.filter((d) => d.type === "same");
+	assert.equal(addedLines.length, 1);
+	assert.equal(removedLines.length, 1);
+	assert.equal(sameLines.length, 6);
+	assert.ok(addedLines[0].text.includes("electron-transfer kinetics"));
+	assert.equal(removedLines[0].text, "Legacy line to remove.");
+
+	// 10.2 Explicit Markdown & WikiLink extraction
+	const links = extractExplicitLinksFromMarkdown(
+		"See [AI & Predictive Maintenance](/topics/applied-ai/ai-predictive-maintenance.md) and [[notes/rul-estimation]]."
+	);
+	assert.ok(links.includes("topics/applied-ai/ai-predictive-maintenance.md"));
+	assert.ok(links.includes("notes/rul-estimation.md"));
+
+	// 10.3 OKF 3-Stage Graph-Traversal-First Engine (Stage 1 Anchor/Hub -> Stage 2 1-hop/2-hop -> Stage 3 Unlinked Bridge)
+	const fileMap = new Map();
+	const fileContents = {
+		"topics/overview.md": `---
+type: topic
+title: Vault Overview
+description: Root Map of Content
+tags: [moc, overview]
+timestamp: "2026-10-25T12:00:00Z"
+---
+Root overview linking to [AI & Predictive Maintenance](/topics/applied-ai/ai-predictive-maintenance.md).`,
+		"topics/applied-ai/ai-predictive-maintenance.md": `---
+type: topic
+title: AI & Predictive Maintenance
+description: Core hub for predictive maintenance, RUL, and prognostics.
+tags: [predictive-maintenance, phm, rul]
+timestamp: "2026-10-25T12:00:00Z"
+---
+Hub connecting [Bearing Fault Diagnostics](/notes/bearing-faults.md).`,
+		"notes/bearing-faults.md": `---
+type: note
+title: Bearing Fault Diagnostics
+description: Vibration and acoustic fault signatures in rotating machinery.
+tags: [predictive-maintenance, bearings]
+timestamp: "2026-10-25T12:00:00Z"
+---
+Connects to [Sensor Fusion Architecture](/notes/sensor-fusion.md).`,
+		"notes/sensor-fusion.md": `---
+type: note
+title: Sensor Fusion Architecture
+description: Combining vibration and thermal telemetry for RUL estimation.
+tags: [sensor-fusion, telemetry]
+timestamp: "2026-10-25T12:00:00Z"
+---
+2-hop note in the explicit wiki graph.`,
+		"notes/unlinked-rul-paper.md": `---
+type: paper
+title: Deep Transformer RUL Estimation
+description: Unlinked paper on remaining useful life prediction for bearings.
+tags: [predictive-maintenance, rul, bearings]
+timestamp: "2026-10-25T12:00:00Z"
+---
+This paper is not yet linked in the explicit graph but shares high semantic/tag similarity.`,
+	};
+
+	const frontmatters = {
+		"topics/overview.md": {
+			type: "topic",
+			title: "Vault Overview",
+			description: "Root Map of Content",
+			tags: ["moc", "overview"],
+		},
+		"topics/applied-ai/ai-predictive-maintenance.md": {
+			type: "topic",
+			title: "AI & Predictive Maintenance",
+			description: "Core hub for predictive maintenance, RUL, and prognostics.",
+			tags: ["predictive-maintenance", "phm", "rul"],
+		},
+		"notes/bearing-faults.md": {
+			type: "note",
+			title: "Bearing Fault Diagnostics",
+			description: "Vibration and acoustic fault signatures in rotating machinery.",
+			tags: ["predictive-maintenance", "bearings"],
+		},
+		"notes/sensor-fusion.md": {
+			type: "note",
+			title: "Sensor Fusion Architecture",
+			description: "Combining vibration and thermal telemetry for RUL estimation.",
+			tags: ["sensor-fusion", "telemetry"],
+		},
+		"notes/unlinked-rul-paper.md": {
+			type: "paper",
+			title: "Deep Transformer RUL Estimation",
+			description: "Unlinked paper on remaining useful life prediction for bearings.",
+			tags: ["predictive-maintenance", "rul", "bearings"],
+		},
+	};
+
+	const vectorStore = {
+		"topics/overview.md": {
+			path: "topics/overview.md",
+			title: "Vault Overview",
+			mtime: 1,
+			type: "topic",
+			description: "Root Map of Content",
+			tags: ["moc", "overview"],
+			vector: normalizeVector([0.2, 0.8, 0.1, 0.1]),
+		},
+		"topics/applied-ai/ai-predictive-maintenance.md": {
+			path: "topics/applied-ai/ai-predictive-maintenance.md",
+			title: "AI & Predictive Maintenance",
+			mtime: 1,
+			type: "topic",
+			description: "Core hub for predictive maintenance, RUL, and prognostics.",
+			tags: ["predictive-maintenance", "phm", "rul"],
+			vector: normalizeVector([0.9, 0.2, 0.1, 0.1]),
+		},
+		"notes/bearing-faults.md": {
+			path: "notes/bearing-faults.md",
+			title: "Bearing Fault Diagnostics",
+			mtime: 1,
+			type: "note",
+			description: "Vibration and acoustic fault signatures in rotating machinery.",
+			tags: ["predictive-maintenance", "bearings"],
+			vector: normalizeVector([0.88, 0.22, 0.12, 0.1]),
+		},
+		"notes/sensor-fusion.md": {
+			path: "notes/sensor-fusion.md",
+			title: "Sensor Fusion Architecture",
+			mtime: 1,
+			type: "note",
+			description: "Combining vibration and thermal telemetry for RUL estimation.",
+			tags: ["sensor-fusion", "telemetry"],
+			vector: normalizeVector([0.82, 0.25, 0.2, 0.1]),
+		},
+		"notes/unlinked-rul-paper.md": {
+			path: "notes/unlinked-rul-paper.md",
+			title: "Deep Transformer RUL Estimation",
+			mtime: 1,
+			type: "paper",
+			description: "Unlinked paper on remaining useful life prediction for bearings.",
+			tags: ["predictive-maintenance", "rul", "bearings"],
+			vector: normalizeVector([0.91, 0.19, 0.11, 0.1]),
+		},
+	};
+
+	const allMockFiles = Object.keys(fileContents).map((p) => {
+		const f = {
+			path: p,
+			name: p.split("/").pop(),
+			basename: p.split("/").pop().replace(/\.md$/i, ""),
+			extension: "md",
+			stat: { mtime: 100 },
+		};
+		fileMap.set(p, f);
+		return f;
+	});
+
+	const mockChatApp = {
+		vault: {
+			getMarkdownFiles: () => allMockFiles,
+			getAbstractFileByPath: (p) => fileMap.get(p) || null,
+			cachedRead: async (file) => fileContents[file.path] || "",
+		},
+		metadataCache: {
+			getFileCache: (file) => ({ frontmatter: frontmatters[file.path] }),
+			getFirstLinkpathDest: (link) => fileMap.get(link) || fileMap.get(`${link}.md`) || null,
+			resolvedLinks: {
+				"topics/overview.md": {
+					"topics/applied-ai/ai-predictive-maintenance.md": 1,
+				},
+				"topics/applied-ai/ai-predictive-maintenance.md": {
+					"notes/bearing-faults.md": 1,
+				},
+				"notes/bearing-faults.md": {
+					"notes/sensor-fusion.md": 1,
+				},
+			},
+		},
+	};
+
+	const mockChatPlugin = {
+		settings: {
+			similarityThreshold: 0.2,
+			headerBoostWeight: 0.15,
+		},
+		indexer: {
+			getStore: () => vectorStore,
+			getRecord: (p) => vectorStore[p],
+			shouldIndexFile: () => true,
+			fetchEmbedding: async () => null,
+		},
+	};
+
+	const traverser = new VaultWikiTraverser(mockChatApp, mockChatPlugin);
+	const traversal = await traverser.traverseForQuery(
+		"Summarize predictive maintenance bearing faults and RUL",
+		fileMap.get("topics/applied-ai/ai-predictive-maintenance.md"),
+		"wiki-active"
+	);
+
+	// Stage 1: Anchor note is first
+	assert.equal(traversal.nodes[0].path, "topics/applied-ai/ai-predictive-maintenance.md");
+	assert.equal(traversal.nodes[0].provenance, "anchor");
+
+	// Stage 2: Explicit 1-hop and 2-hop links come BEFORE Stage 3 unlinked vector bridges
+	const bearingNode = traversal.nodes.find((n) => n.path === "notes/bearing-faults.md");
+	const fusionNode = traversal.nodes.find((n) => n.path === "notes/sensor-fusion.md");
+	const bridgeNode = traversal.nodes.find((n) => n.path === "notes/unlinked-rul-paper.md");
+
+	assert.ok(bearingNode, "1-hop linked note should be traversed in Stage 2");
+	assert.equal(bearingNode.provenance, "graph-1hop");
+	assert.ok(fusionNode, "2-hop linked note should be traversed in Stage 2");
+	assert.equal(fusionNode.provenance, "graph-2hop");
+	assert.ok(bridgeNode, "Unlinked note should be discovered in Stage 3 as an unlinked-bridge");
+	assert.equal(bridgeNode.provenance, "unlinked-bridge");
+
+	// Verify Stage 2 nodes precede Stage 3 bridge nodes in traversal order
+	const idx1Hop = traversal.nodes.indexOf(bearingNode);
+	const idxBridge = traversal.nodes.indexOf(bridgeNode);
+	assert.ok(idx1Hop < idxBridge, "Explicit 1-hop graph links must precede unlinked vector bridge fallback");
+
+	// 10.4 Read-only synthesis vs Proposed Note Edit parsing & "+ File Synthesis as Note..." proposal builder
+	const readOnlyResp = parseVaultChatResponse(
+		JSON.stringify({
+			replyMarkdown: "Here is a synthesis of [Bearing Fault Diagnostics](/notes/bearing-faults.md).",
+			proposedChanges: [],
+		})
+	);
+	assert.equal(readOnlyResp.proposedChanges.length, 0);
+	assert.ok(readOnlyResp.replyMarkdown.includes("/notes/bearing-faults.md"));
+
+	const editResp = parseVaultChatResponse(
+		JSON.stringify({
+			replyMarkdown: "I prepared the requested update.",
+			proposedChanges: [
+				{
+					action: "modify",
+					targetPath: "/notes/bearing-faults.md",
+					summary: "Add RUL transformer reference",
+					proposedContent: newNote,
+				},
+			],
+		})
+	);
+	assert.equal(editResp.proposedChanges.length, 1);
+	assert.equal(editResp.proposedChanges[0].action, "modify");
+	assert.equal(editResp.proposedChanges[0].targetPath, "notes/bearing-faults.md");
+
+	const filedProposal = buildSynthesisNoteProposal(
+		"# Bearing Prognostics Synthesis\n\nSynthesized findings across [Bearing Fault Diagnostics](/notes/bearing-faults.md).",
+		"Bearing Prognostics Synthesis",
+		traversal.nodes
+	);
+	assert.equal(filedProposal.action, "create");
+	assert.equal(filedProposal.targetPath, "notes/bearing-prognostics-synthesis.md");
+	assert.ok(filedProposal.proposedContent.includes("type: note"));
+	assert.ok(filedProposal.proposedContent.includes("## Related"));
+	// 10.5 Low-Token Header-First Graph Map & On-Demand Selective Note Reading
+	const headerResult = await traverser.traverseHeaderGraph(
+		"Summarize predictive maintenance bearing faults and RUL",
+		fileMap.get("topics/applied-ai/ai-predictive-maintenance.md"),
+		"wiki-active"
+	);
+	assert.ok(headerResult.nodes.length >= 3);
+	assert.ok(headerResult.headerMapMarkdown.includes("OKF GRAPH HEADER CHEATSHEET"));
+	assert.equal(headerResult.nodes[0].provenance, "anchor");
+	// Header map is compact (<1200 characters, ~300 tokens)
+	assert.ok(headerResult.headerMapMarkdown.length < 1500);
+
+	// Test on-demand reading of 1 note requested by model in Pass 1
+	const selectedBodies = await traverser.readSelectedNotes(
+		["notes/bearing-faults.md"],
+		headerResult.nodes
+	);
+	assert.ok(selectedBodies["notes/bearing-faults.md"].includes("Sensor Fusion Architecture"));
+	const readNode = headerResult.nodes.find((n) => n.path === "notes/bearing-faults.md");
+	assert.equal(readNode?.wasReadInFull, true);
+
+	// 10.6 Low-Token Edit Patches (append and replace)
+	const baseNoteContent = [
+		"---",
+		"type: note",
+		"title: Bearing Fault Diagnostics",
+		"---",
+		"",
+		"Initial vibration telemetry findings.",
+		"",
+		"## Related",
+		"- [Topic Hub](/topics/applied-ai/ai-predictive-maintenance.md)",
+	].join("\n");
+
+	const appendPatched = applyProposedPatchToContent(baseNoteContent, {
+		mode: "append",
+		replaceBlock: "### Acoustic Emission Telemetry\nHigh frequency acoustic wave analysis detects micro-spalling.",
+	});
+	assert.ok(appendPatched.includes("### Acoustic Emission Telemetry"));
+	assert.ok(appendPatched.indexOf("Acoustic Emission Telemetry") < appendPatched.indexOf("## Related"));
+
+	const replacePatched = applyProposedPatchToContent(baseNoteContent, {
+		mode: "replace",
+		searchBlock: "Initial vibration telemetry findings.",
+		replaceBlock: "Comprehensive multi-sensor spectral analysis.",
+	});
+	assert.ok(replacePatched.includes("Comprehensive multi-sensor spectral analysis."));
+	assert.ok(!replacePatched.includes("Initial vibration telemetry findings."));
+
+	// 10.7 Antigravity-Style Thinking & Natural Conversational Chat Parsing (both JSON & Direct Markdown)
+	const thinkChatResp = parseVaultChatResponse(
+		"<think>\nInspecting bearing diagnostics hub and fault signatures.\nSynthesizing vibration and acoustic emission patterns.\n</think>\n" +
+			JSON.stringify({
+				thoughtSteps: [
+					"Checked active note and 4 OKF graph headers",
+					"Evaluated spectral vibration patterns",
+				],
+				readPaths: ["notes/bearing-faults.md"],
+				replyMarkdown:
+					"Here is a summary of the bearing fault regime connecting [Sensor Fusion Architecture](/notes/sensor-fusion.md) with vibration telemetry.",
+				proposedChanges: [],
+			})
+	);
+	assert.equal(thinkChatResp.readPaths?.length, 1);
+	assert.equal(thinkChatResp.readPaths?.[0], "notes/bearing-faults.md");
+	assert.ok(thinkChatResp.thoughtSteps.length >= 2);
+	assert.ok(thinkChatResp.replyMarkdown.includes("Sensor Fusion Architecture"));
+
+	// Direct unconstrained Markdown test (no JSON wrapping)
+	const directMarkdownResp = parseVaultChatResponse(
+		`<think>
+1. Evaluate user question on acoustic emission
+2. Trace connection between sensor-fusion.md and predictive maintenance hub
+</think>
+<read>notes/sensor-fusion.md</read>
+
+Based on the traversed vault notes, acoustic emission telemetry provides earlier defect detection than vibration analysis alone. You can explore [Sensor Fusion](/notes/sensor-fusion.md) for architecture details.
+
+\`\`\`proposed-note
+action: create
+targetPath: notes/acoustic-emission-telemetry.md
+title: Acoustic Emission Telemetry
+summary: Novel high-frequency acoustic wave analysis for micro-spalling detection
+hub: topics/applied-ai/ai-predictive-maintenance.md
+---
+---
+type: note
+title: Acoustic Emission Telemetry
+tags: [acoustics, sensors, predictive-maintenance]
+---
+
+## Summary
+Acoustic emission waves propagate at 100 kHz - 1 MHz frequencies during early micro-spalling.
+\`\`\``
+	);
+
+	assert.equal(directMarkdownResp.readPaths?.length, 1);
+	assert.equal(directMarkdownResp.readPaths?.[0], "notes/sensor-fusion.md");
+	assert.equal(directMarkdownResp.thoughtSteps.length, 2);
+	assert.ok(directMarkdownResp.replyMarkdown.includes("acoustic emission telemetry provides earlier defect detection"));
+	assert.ok(!directMarkdownResp.replyMarkdown.includes("```proposed-note"));
+	assert.equal(directMarkdownResp.proposedChanges.length, 1);
+	assert.equal(directMarkdownResp.proposedChanges[0].action, "create");
+	assert.equal(directMarkdownResp.proposedChanges[0].targetPath, "notes/acoustic-emission-telemetry.md");
+	assert.equal(directMarkdownResp.proposedChanges[0].title, "Acoustic Emission Telemetry");
+	assert.equal(directMarkdownResp.proposedChanges[0].suggestedHubPath, "topics/applied-ai/ai-predictive-maintenance.md");
+	assert.ok(directMarkdownResp.proposedChanges[0].proposedContent.includes("100 kHz - 1 MHz"));
+
+	console.log("✔ Vault Chat & Diff Modal: 3-stage OKF Graph-Traversal-First engine, LCS line diff, low-token header-first context, and conversational chat verified.");
 }
 
 console.log("=== All Lattice Tests Passed ===");

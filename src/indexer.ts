@@ -235,6 +235,28 @@ export class VectorIndexer {
 	}
 
 	/**
+	 * Fetches installed models from local Ollama via /api/tags.
+	 */
+	public async fetchInstalledOllamaModels(): Promise<string[]> {
+		try {
+			const res = await requestUrl({
+				url: `${this.plugin.settings.ollamaUrl}/api/tags`,
+				method: "GET",
+				throw: false,
+			});
+			if (res.status === 200 && Array.isArray(res.json?.models)) {
+				this.isOllamaOnline = true;
+				return res.json.models
+					.map((m: { name?: string }) => m.name || "")
+					.filter(Boolean);
+			}
+			return [];
+		} catch {
+			return [];
+		}
+	}
+
+	/**
 	 * Debounced handler for vault create/modify events (default 2000ms).
 	 */
 	public queueFileIndex(file: TAbstractFile): void {

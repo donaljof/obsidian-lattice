@@ -4,6 +4,7 @@ import type LatticePlugin from "./main";
 export type OKFType = "note" | "paper" | "topic" | "project";
 export type AIProvider = "ollama" | "cloud" | "auto";
 export type CloudProvider = "gemini" | "anthropic" | "openai";
+export type ChatScopeMode = "wiki-active" | "wiki-global" | "active-only";
 
 export interface OKFFrontmatter {
 	type?: OKFType | string;
@@ -46,6 +47,7 @@ export interface LatticeSettings {
 	topK: number;
 	similarityThreshold: number;
 	headerBoostWeight: number;
+	defaultChatScope: ChatScopeMode;
 	debounceMs: number;
 	exportSharedVectors: boolean;
 	sharedVectorsPath: string;
@@ -55,7 +57,7 @@ export interface LatticeSettings {
 export const DEFAULT_SETTINGS: LatticeSettings = {
 	ollamaUrl: "http://localhost:11434",
 	embeddingModel: "nomic-embed-text",
-	chatModel: "llama3.2",
+	chatModel: "qwen3:8b",
 	aiProvider: "auto",
 	cloudProvider: "gemini",
 	cloudApiKey: "",
@@ -97,6 +99,7 @@ export const DEFAULT_SETTINGS: LatticeSettings = {
 	topK: 5,
 	similarityThreshold: 0.35,
 	headerBoostWeight: 0.15,
+	defaultChatScope: "wiki-active",
 	debounceMs: 2000,
 	exportSharedVectors: true,
 	sharedVectorsPath: ".okf/vectors.json",
@@ -165,18 +168,46 @@ export class LatticeSettingTab extends PluginSettingTab {
 					})
 			);
 
-		new Setting(containerEl)
+		const chatModelSetting = new Setting(containerEl)
 			.setName("Chat / Metadata Model")
-			.setDesc("Ollama model used for OKF frontmatter generation and single-URL ingestion (e.g., llama3.2, qwen2.5).")
-			.addText((text) =>
-				text
-					.setPlaceholder("llama3.2")
-					.setValue(this.plugin.settings.chatModel)
-					.onChange(async (value) => {
-						this.plugin.settings.chatModel = value.trim() || "llama3.2";
-						await this.plugin.savePluginData();
-					})
+			.setDesc(
+				"Ollama model used for conversational chat and OKF synthesis. Larger models (e.g. qwen3:8b, mistral:latest) provide substantially higher reasoning and synthesis quality than 3B models."
 			);
+
+		void this.plugin.indexer.fetchInstalledOllamaModels().then((models) => {
+			const chatModels = models.filter((m) => !m.includes("embed"));
+			if (chatModels.length > 0) {
+				chatModelSetting.addDropdown((drop) => {
+					for (const m of chatModels) {
+						drop.addOption(m, m);
+					}
+					if (
+						this.plugin.settings.chatModel &&
+						!chatModels.includes(this.plugin.settings.chatModel)
+					) {
+						drop.addOption(
+							this.plugin.settings.chatModel,
+							this.plugin.settings.chatModel
+						);
+					}
+					drop.setValue(this.plugin.settings.chatModel || chatModels[0]);
+					drop.onChange(async (val) => {
+						this.plugin.settings.chatModel = val;
+						await this.plugin.savePluginData();
+					});
+				});
+			} else {
+				chatModelSetting.addText((text) =>
+					text
+						.setPlaceholder("qwen3:8b")
+						.setValue(this.plugin.settings.chatModel)
+						.onChange(async (value) => {
+							this.plugin.settings.chatModel = value.trim() || "qwen3:8b";
+							await this.plugin.savePluginData();
+						})
+				);
+			}
+		});
 
 		// --- Discovery & Retrieval ---
 		containerEl.createEl("h3", { text: "Semantic Discovery & Retrieval" });
@@ -229,6 +260,31 @@ export class LatticeSettingTab extends PluginSettingTab {
 			);
 
 		// --- Vault & OKF Configuration ---
+		containerEl.createEl("h3", { text: "Chat & Knowledge Traversal" });
+
+		new Setting(containerEl)
+			.setName("Default Knowledge Traversal Scope")
+			.setDesc(
+				"Scope of vault notes consulted by the Chat Assistant. 'Active Note + Wiki Graph' traverses explicit links & hubs from the active note first."
+			)
+			.addDropdown((drop) =>
+				drop
+					.addOption(
+						"wiki-active",
+						"Active Note + Wiki Graph (Default & Recommended)"
+					)
+					.addOption(
+						"wiki-global",
+						"Global Wiki Graph (/topics/overview.md & Hubs)"
+					)
+					.addOption("active-only", "Active Note Only")
+					.setValue(this.plugin.settings.defaultChatScope || "wiki-active")
+					.onChange(async (val) => {
+						this.plugin.settings.defaultChatScope = val as ChatScopeMode;
+						await this.plugin.savePluginData();
+					})
+			);
+
 		containerEl.createEl("h3", { text: "OKF Vault Boundaries & CLI Sync" });
 
 		new Setting(containerEl)

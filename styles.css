@@ -491,9 +491,13 @@
 
 .lattice-modal-footer {
 	display: flex;
+	align-items: center;
 	justify-content: flex-end;
-	gap: 8px;
+	gap: 10px;
 	margin-top: 16px;
+	flex-wrap: wrap;
+	width: 100%;
+	box-sizing: border-box;
 }
 
 /* Ingest Dropzone & File Pickers */
@@ -522,4 +526,469 @@
 	padding: 4px;
 	background: var(--background-modifier-form-field);
 	border-radius: 4px;
+}
+
+/* ==========================================================================
+   Sidebar Mode Toggle ([Discovery | Chat]) & Wiki Chat Panel
+   ========================================================================== */
+
+.lattice-mode-tabs {
+	display: flex;
+	gap: 4px;
+	margin: 0;
+	background: var(--background-secondary);
+	padding: 3px;
+	border-radius: 6px;
+	border: 1px solid var(--background-modifier-border);
+}
+
+.lattice-mode-tab {
+	flex: 1;
+	font-size: 0.76rem;
+	font-weight: 600;
+	padding: 4px 8px;
+	border-radius: 4px;
+	border: none;
+	background: transparent;
+	color: var(--text-muted);
+	cursor: pointer;
+	transition: all 0.14s ease;
+}
+
+.lattice-mode-tab:hover {
+	color: var(--text-normal);
+}
+
+.lattice-mode-tab.is-active {
+	background: var(--interactive-accent);
+	color: var(--text-on-accent);
+}
+
+.lattice-chat-container {
+	display: flex;
+	flex-direction: column;
+	gap: 10px;
+	flex: 1;
+	min-height: 0;
+}
+
+.lattice-chat-header {
+	display: flex;
+	align-items: center;
+	justify-content: flex-end;
+	gap: 8px;
+	padding: 4px 6px;
+	border-bottom: 1px solid var(--background-modifier-border);
+}
+
+.lattice-chat-anchor-group {
+	display: flex;
+	align-items: center;
+	gap: 6px;
+	min-width: 0;
+	overflow: hidden;
+}
+
+.lattice-chat-quick-actions {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 5px;
+}
+
+.lattice-chat-thread {
+	display: flex;
+	flex-direction: column;
+	gap: 10px;
+	flex: 1;
+	overflow-y: auto;
+	padding-right: 2px;
+}
+
+.lattice-chat-message {
+	display: flex;
+	flex-direction: column;
+	gap: 6px;
+	padding: 9px 10px;
+	border-radius: 8px;
+	border: 1px solid var(--background-modifier-border);
+	font-size: 0.82rem;
+	line-height: 1.45;
+}
+
+.lattice-chat-user {
+	background: rgba(59, 130, 246, 0.08);
+	border-color: rgba(59, 130, 246, 0.28);
+}
+
+.lattice-chat-assistant {
+	background: var(--background-secondary);
+}
+
+.lattice-chat-role {
+	font-size: 0.7rem;
+	font-weight: 700;
+	text-transform: uppercase;
+	letter-spacing: 0.04em;
+	color: var(--text-muted);
+}
+
+.lattice-chat-reply {
+	display: flex;
+	flex-direction: column;
+	gap: 6px;
+	word-break: break-word;
+}
+
+.lattice-chat-paragraph {
+	margin: 0;
+	line-height: 1.45;
+}
+
+.lattice-chat-heading {
+	margin: 6px 0 2px 0;
+	font-weight: 600;
+	color: var(--text-normal);
+}
+
+.lattice-chat-list {
+	margin: 2px 0 4px 18px;
+	padding: 0;
+	display: flex;
+	flex-direction: column;
+	gap: 3px;
+}
+
+.lattice-chat-list li {
+	margin: 0;
+	line-height: 1.4;
+}
+
+.lattice-chat-inline-code {
+	font-family: var(--font-monospace);
+	font-size: 0.78rem;
+	background: var(--background-primary);
+	padding: 1px 4px;
+	border-radius: 3px;
+	border: 1px solid var(--background-modifier-border);
+}
+
+.lattice-chat-link {
+	color: var(--text-accent);
+	text-decoration: underline;
+	cursor: pointer;
+}
+
+.lattice-chat-link:hover {
+	opacity: 0.85;
+}
+
+/* ==========================================================================
+   Decluttered Wiki Trail & Subtle Thought
+   ========================================================================== */
+
+.lattice-trail-row {
+	display: flex;
+	align-items: center;
+	gap: 5px;
+	flex-wrap: wrap;
+	padding: 2px 0 4px 0;
+	border-bottom: 1px solid var(--background-modifier-border);
+	margin-bottom: 4px;
+}
+
+.lattice-trail-label {
+	font-size: 0.68rem;
+	font-weight: 600;
+	text-transform: uppercase;
+	letter-spacing: 0.04em;
+	color: var(--text-faint);
+	margin-right: 2px;
+}
+
+.lattice-traversal-chip {
+	display: inline-flex;
+	align-items: center;
+	gap: 4px;
+	padding: 1px 6px;
+	border-radius: 4px;
+	font-size: 0.7rem;
+	background: var(--background-primary);
+	border: 1px solid var(--background-modifier-border);
+}
+
+.lattice-traversal-chip-title {
+	cursor: pointer;
+	color: var(--text-muted);
+	max-width: 150px;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+.lattice-traversal-chip-title:hover {
+	color: var(--interactive-accent);
+	text-decoration: underline;
+}
+
+.lattice-prov-anchor {
+	border-color: rgba(59, 130, 246, 0.35);
+}
+
+.lattice-prov-topic-hub {
+	border-color: rgba(168, 85, 247, 0.35);
+}
+
+.lattice-prov-graph-1hop {
+	border-color: rgba(34, 197, 94, 0.35);
+}
+
+.lattice-prov-graph-2hop {
+	border-color: rgba(20, 184, 166, 0.35);
+}
+
+.lattice-prov-unlinked-bridge {
+	border-color: rgba(245, 158, 11, 0.4);
+}
+
+.lattice-bridge-add-icon {
+	font-size: 0.72rem;
+	font-weight: 700;
+	color: #fbbf24;
+	cursor: pointer;
+	padding: 0 3px;
+	border-radius: 3px;
+	background: rgba(245, 158, 11, 0.16);
+}
+
+.lattice-bridge-add-icon:hover {
+	background: var(--interactive-accent);
+	color: var(--text-on-accent);
+}
+
+.lattice-thought-drawer {
+	border: 1px solid var(--background-modifier-border);
+	border-radius: 4px;
+	background: var(--background-primary);
+	margin-bottom: 6px;
+}
+
+.lattice-thought-summary {
+	padding: 3px 6px;
+	font-size: 0.7rem;
+	color: var(--text-faint);
+	cursor: pointer;
+	user-select: none;
+}
+
+.lattice-thought-summary:hover {
+	color: var(--text-muted);
+}
+
+.lattice-thought-bullets {
+	margin: 4px 0 4px 16px;
+	padding: 0;
+	font-size: 0.7rem;
+	color: var(--text-faint);
+	line-height: 1.35;
+}
+
+.lattice-chat-timestamp {
+	font-size: 0.67rem;
+	color: var(--text-faint);
+	text-align: right;
+	margin-top: 2px;
+}
+
+.lattice-chat-input-area {
+	display: flex;
+	flex-direction: column;
+	gap: 6px;
+	padding-top: 6px;
+	border-top: 1px solid var(--background-modifier-border);
+}
+
+.lattice-chat-input {
+	width: 100%;
+	resize: vertical;
+	min-height: 60px;
+	padding: 6px 8px;
+	font-size: 0.82rem;
+	border-radius: 6px;
+	border: 1px solid var(--background-modifier-border);
+	background: var(--background-primary);
+	color: var(--text-normal);
+}
+
+.lattice-chat-input-footer {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	gap: 6px;
+}
+
+.lattice-chat-hint {
+	font-size: 0.7rem;
+	color: var(--text-faint);
+}
+
+/* ==========================================================================
+   Pop-up Diff & Approval Modal (NoteChangeApprovalModal)
+   ========================================================================== */
+
+.modal.lattice-diff-modal-window,
+.modal:has(.lattice-diff-modal) {
+	width: min(900px, 92vw) !important;
+	max-width: 92vw !important;
+}
+
+.modal.lattice-diff-modal-window .modal-content,
+.modal:has(.lattice-diff-modal) .modal-content {
+	overflow-x: hidden;
+	max-width: 100%;
+}
+
+.lattice-diff-modal {
+	display: flex;
+	flex-direction: column;
+	gap: 12px;
+	width: 100%;
+	max-width: 100%;
+	box-sizing: border-box;
+}
+
+.lattice-diff-meta {
+	display: flex;
+	flex-direction: column;
+	gap: 6px;
+	padding: 8px 10px;
+	background: var(--background-secondary);
+	border-radius: 6px;
+	border: 1px solid var(--background-modifier-border);
+}
+
+.lattice-diff-path-row {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	flex-wrap: wrap;
+}
+
+.lattice-diff-path-input {
+	flex: 1;
+	min-width: 240px;
+	font-family: var(--font-monospace);
+	font-size: 0.8rem;
+	padding: 4px 8px;
+	box-sizing: border-box;
+}
+
+.lattice-diff-summary {
+	margin: 0;
+	font-size: 0.8rem;
+	color: var(--text-muted);
+}
+
+.lattice-diff-tabs {
+	display: flex;
+	gap: 6px;
+}
+
+.lattice-diff-body {
+	max-height: 54vh;
+	overflow-y: auto;
+	overflow-x: hidden;
+	border: 1px solid var(--background-modifier-border);
+	border-radius: 6px;
+	background: var(--background-primary);
+	padding: 8px;
+	width: 100%;
+	box-sizing: border-box;
+}
+
+.lattice-diff-stats {
+	font-size: 0.74rem;
+	font-family: var(--font-monospace);
+	color: var(--text-muted);
+	margin-bottom: 6px;
+}
+
+.lattice-diff-lines {
+	display: flex;
+	flex-direction: column;
+	font-family: var(--font-monospace);
+	font-size: 0.76rem;
+	line-height: 1.4;
+	width: 100%;
+	max-width: 100%;
+}
+
+.lattice-diff-line {
+	display: flex;
+	gap: 8px;
+	padding: 2px 6px;
+	white-space: pre-wrap;
+	word-break: break-word;
+	overflow-wrap: anywhere;
+	border-radius: 2px;
+	min-width: 0;
+}
+
+.lattice-diff-text {
+	flex: 1;
+	min-width: 0;
+	white-space: pre-wrap;
+	word-break: break-word;
+	overflow-wrap: anywhere;
+}
+
+.lattice-diff-prefix {
+	user-select: none;
+	font-weight: 700;
+	width: 12px;
+	flex-shrink: 0;
+}
+
+.lattice-diff-add {
+	background: rgba(34, 197, 94, 0.16);
+	color: var(--text-normal);
+	border-left: 3px solid var(--color-green);
+}
+
+.lattice-diff-remove {
+	background: rgba(239, 68, 68, 0.16);
+	color: var(--text-muted);
+	text-decoration: line-through;
+	border-left: 3px solid var(--color-red);
+}
+
+.lattice-diff-same {
+	color: var(--text-muted);
+}
+
+.lattice-diff-textarea {
+	width: 100%;
+	min-height: 320px;
+	font-family: var(--font-monospace);
+	font-size: 0.78rem;
+	line-height: 1.45;
+	padding: 8px;
+	border: 1px solid var(--background-modifier-border);
+	border-radius: 4px;
+	background: var(--background-primary);
+	color: var(--text-normal);
+	resize: vertical;
+}
+
+.lattice-diff-hub-option {
+	padding: 6px 8px;
+	background: var(--background-secondary);
+	border-radius: 6px;
+	font-size: 0.8rem;
+}
+
+.lattice-diff-hub-label {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	cursor: pointer;
 }

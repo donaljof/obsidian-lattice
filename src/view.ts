@@ -1,4 +1,15 @@
 import { ItemView, Notice, TFile, WorkspaceLeaf } from "obsidian";
+import {
+	NoteChangeApprovalModal,
+	VaultWikiTraverser,
+	applyProposedPatchToContent,
+	buildSynthesisNoteProposal,
+	type ChatMessage,
+	type ChatScopeMode,
+	type ChatStepPill,
+	type TraversedWikiNode,
+} from "./chat";
+import { chatWithVaultLLM, type ProposedNoteChange } from "./llm";
 import type LatticePlugin from "./main";
 import { findRelatedConcepts } from "./math";
 import type { ScoredVectorRecord } from "./settings";
@@ -10,6 +21,13 @@ export class LatticeSidebarView extends ItemView {
 	private activeTypeFilter = "All";
 	private lastActiveFile: TFile | null = null;
 	private showVaultConformancePanel = false;
+	private sidebarMode: "connect" | "chat" = "connect";
+	private chatMessages: ChatMessage[] = [];
+	private chatDraft = "";
+	private isChatGenerating = false;
+	private currentAnchorPath: string | null = null;
+	private chatHistoryByNote = new Map<string, ChatMessage[]>();
+	private globalChatHistory: Array<{ role: "user" | "assistant"; content: string }> = [];
 
 	constructor(leaf: WorkspaceLeaf, plugin: LatticePlugin) {
 		super(leaf);
@@ -17,8 +35,14 @@ export class LatticeSidebarView extends ItemView {
 	}
 
 	public openVaultConformancePanel(): void {
+		this.sidebarMode = "connect";
 		this.showVaultConformancePanel = true;
 		this.plugin.okf.scanVaultOKFConformance(true);
+		void this.renderView();
+	}
+
+	public openChatPanel(): void {
+		this.sidebarMode = "chat";
 		void this.renderView();
 	}
 
@@ -27,7 +51,7 @@ export class LatticeSidebarView extends ItemView {
 	}
 
 	getDisplayText(): string {
-		return "Lattice — Related Concepts";
+		return this.sidebarMode === "chat" ? "Lattice Chat" : "Lattice Connect";
 	}
 
 	getIcon(): string {
@@ -68,37 +92,64 @@ export class LatticeSidebarView extends ItemView {
 		} else {
 			statusDot.setAttr("title", "Ollama connected");
 		}
-		titleEl.createSpan({ text: "Lattice Discovery" });
+		titleEl.createSpan({
+			text: this.sidebarMode === "chat" ? "Lattice Chat" : "Lattice Connect",
+		});
 
 		const headerActions = headerTop.createDiv({ cls: "lattice-filter-bar" });
-		const checkVaultBtn = headerActions.createEl("button", {
-			cls: `lattice-btn ${
-				this.showVaultConformancePanel ? "lattice-btn-primary" : ""
-			}`,
-			text: "Check Vault OKF",
+
+		// Place action buttons (Check OKF & Sync) to the left of the mode toggle so the toggle stays pinned on the right
+		if (this.sidebarMode === "connect") {
+			const checkVaultBtn = headerActions.createEl("button", {
+				cls: `lattice-btn ${
+					this.showVaultConformancePanel ? "lattice-btn-primary" : ""
+				}`,
+				text: "Check OKF",
+			});
+			checkVaultBtn.setAttr(
+				"title",
+				"Lightweight in-memory OKF conformance scan across all vault notes (<2ms)"
+			);
+			checkVaultBtn.addEventListener("click", () => {
+				this.showVaultConformancePanel = !this.showVaultConformancePanel;
+				if (this.showVaultConformancePanel) {
+					this.plugin.okf.scanVaultOKFConformance(true);
+				}
+				void this.renderView();
+			});
+
+			const syncBtn = headerActions.createEl("button", {
+				cls: "lattice-btn",
+				text: "Sync",
+			});
+			syncBtn.setAttr("title", "Incremental vault vector sync");
+			syncBtn.addEventListener("click", async () => {
+				await this.plugin.indexer.scanVault(false);
+			});
+		}
+
+		const modeTabs = headerActions.createDiv({ cls: "lattice-mode-tabs" });
+		const connectTab = modeTabs.createEl("button", {
+			cls: `lattice-mode-tab ${this.sidebarMode === "connect" ? "is-active" : ""}`,
+			text: "Connect",
 		});
-		checkVaultBtn.setAttr(
-			"title",
-			"Lightweight in-memory OKF conformance scan across all vault notes (<2ms)"
-		);
-		checkVaultBtn.addEventListener("click", () => {
-			this.showVaultConformancePanel = !this.showVaultConformancePanel;
-			if (this.showVaultConformancePanel) {
-				this.plugin.okf.scanVaultOKFConformance(true);
-			}
+		connectTab.setAttr("title", "Lattice Connect (Related Concepts & Discovery)");
+		const chatTab = modeTabs.createEl("button", {
+			cls: `lattice-mode-tab ${this.sidebarMode === "chat" ? "is-active" : ""}`,
+			text: "Chat",
+		});
+		chatTab.setAttr("title", "Lattice Chat (Knowledge Assistant)");
+
+		connectTab.addEventListener("click", () => {
+			this.sidebarMode = "connect";
+			void this.renderView();
+		});
+		chatTab.addEventListener("click", () => {
+			this.sidebarMode = "chat";
 			void this.renderView();
 		});
 
-		const syncBtn = headerActions.createEl("button", {
-			cls: "lattice-btn",
-			text: "Sync",
-		});
-		syncBtn.setAttr("title", "Incremental vault vector sync");
-		syncBtn.addEventListener("click", async () => {
-			await this.plugin.indexer.scanVault(false);
-		});
-
-		if (this.showVaultConformancePanel) {
+		if (this.sidebarMode === "connect" && this.showVaultConformancePanel) {
 			this.renderVaultConformancePanel(container);
 		}
 
@@ -113,6 +164,23 @@ export class LatticeSidebarView extends ItemView {
 				  this.app.vault.getAbstractFileByPath(this.lastActiveFile.path) instanceof TFile
 				? this.lastActiveFile
 				: null;
+
+		// Track anchor note changes: clear displayed chat for the new note, but preserve history in chatHistoryByNote
+		const currentPath = activeFile ? activeFile.path : "__none__";
+		if (this.currentAnchorPath !== currentPath) {
+			if (this.currentAnchorPath) {
+				this.chatHistoryByNote.set(this.currentAnchorPath, [...this.chatMessages]);
+			}
+			this.currentAnchorPath = currentPath;
+			this.chatMessages = this.chatHistoryByNote.get(currentPath)
+				? [...this.chatHistoryByNote.get(currentPath)!]
+				: [];
+		}
+
+		if (this.sidebarMode === "chat") {
+			this.renderChatPanel(container, activeFile);
+			return;
+		}
 
 		if (!activeFile) {
 			const empty = container.createDiv({ cls: "lattice-empty-state" });
@@ -805,6 +873,532 @@ export class LatticeSidebarView extends ItemView {
 				cls: "lattice-conformance-missing",
 				text: `+ ${summary.invalidNotes.length - maxVisible} more incomplete note(s)...`,
 			});
+		}
+	}
+
+	/**
+	 * Renders the clean, conversational OKF Wiki Chat Panel.
+	 */
+	private renderChatPanel(
+		container: HTMLElement,
+		activeFile: TFile | null
+	): void {
+		const chatWrap = container.createDiv({ cls: "lattice-chat-container" });
+
+		// 1. Chat Actions Header (Clear chat)
+		if (this.chatMessages.length > 0) {
+			const chatHeader = chatWrap.createDiv({ cls: "lattice-chat-header" });
+			const clearBtn = chatHeader.createEl("button", {
+				cls: "lattice-btn",
+				text: "Clear Chat",
+			});
+			clearBtn.setAttr("title", "Clear chat history for current note");
+			clearBtn.addEventListener("click", () => {
+				this.chatMessages = [];
+				if (this.currentAnchorPath) {
+					this.chatHistoryByNote.delete(this.currentAnchorPath);
+				}
+				void this.renderView();
+			});
+		}
+
+		// 2. Message Thread
+		const threadEl = chatWrap.createDiv({ cls: "lattice-chat-thread" });
+
+		if (this.chatMessages.length === 0) {
+			const empty = threadEl.createDiv({ cls: "lattice-empty-state" });
+			empty.createEl("div", {
+				text: "Ask questions, synthesize themes, or explore connections across your vault.",
+			});
+
+			const quickGroup = empty.createDiv({ cls: "lattice-chat-quick-actions" });
+			const quickPrompts = activeFile
+				? [
+						"Summarize active note and its key links",
+						"What open questions or cross-domain themes emerge?",
+				  ]
+				: [
+						"What core topics are in the vault?",
+						"Synthesize recent insights across active projects",
+				  ];
+			for (const qp of quickPrompts) {
+				const qBtn = quickGroup.createEl("button", {
+					cls: "lattice-btn",
+					text: qp,
+				});
+				qBtn.addEventListener("click", () => {
+					void this.sendChatPrompt(qp, activeFile);
+				});
+			}
+		} else {
+			for (const msg of this.chatMessages) {
+				this.renderChatMessage(threadEl, msg, activeFile);
+			}
+		}
+
+		if (this.isChatGenerating) {
+			const thinkingEl = threadEl.createDiv({
+				cls: "lattice-chat-message lattice-chat-assistant",
+			});
+			thinkingEl.createDiv({
+				cls: "lattice-chat-thinking",
+				text: "Traversing OKF graph & synthesizing...",
+			});
+		}
+
+		// Scroll thread to bottom
+		setTimeout(() => {
+			threadEl.scrollTop = threadEl.scrollHeight;
+		}, 10);
+
+		// 3. Input Box
+		const inputBox = chatWrap.createDiv({ cls: "lattice-chat-input-area" });
+		const textarea = inputBox.createEl("textarea", {
+			cls: "lattice-chat-input",
+			placeholder:
+				"Ask a question or discuss connections across your notes...",
+		});
+		textarea.rows = 3;
+		textarea.value = this.chatDraft;
+		textarea.disabled = this.isChatGenerating;
+
+		textarea.addEventListener("input", (e) => {
+			this.chatDraft = (e.target as HTMLTextAreaElement).value;
+		});
+
+		const inputFooter = inputBox.createDiv({ cls: "lattice-chat-input-footer" });
+		inputFooter.createSpan({
+			cls: "lattice-conformance-missing",
+			text: "Conversational pairing • Proposes notes only when new themes emerge",
+		});
+
+		const sendBtn = inputFooter.createEl("button", {
+			cls: "lattice-btn lattice-btn-primary",
+			text: this.isChatGenerating ? "Thinking..." : "Send",
+		});
+		sendBtn.disabled = this.isChatGenerating;
+
+		const submit = () => {
+			const text = this.chatDraft.trim();
+			if (!text || this.isChatGenerating) return;
+			this.chatDraft = "";
+			void this.sendChatPrompt(text, activeFile);
+		};
+
+		sendBtn.addEventListener("click", submit);
+		textarea.addEventListener("keydown", (e) => {
+			if (e.key === "Enter" && !e.shiftKey) {
+				e.preventDefault();
+				submit();
+			}
+		});
+	}
+
+	private async sendChatPrompt(
+		promptText: string,
+		activeFile: TFile | null
+	): Promise<void> {
+		const userMsg: ChatMessage = {
+			id: `u-${Date.now()}`,
+			role: "user",
+			content: promptText,
+			timestamp: new Date().toLocaleTimeString([], {
+				hour: "2-digit",
+				minute: "2-digit",
+			}),
+		};
+		this.chatMessages.push(userMsg);
+		if (this.currentAnchorPath) {
+			this.chatHistoryByNote.set(this.currentAnchorPath, [...this.chatMessages]);
+		}
+		this.isChatGenerating = true;
+		await this.renderView();
+
+		try {
+			const traverser = new VaultWikiTraverser(this.app, this.plugin);
+			const headerResult = await traverser.traverseHeaderGraph(
+				promptText,
+				activeFile,
+				this.plugin.settings.defaultChatScope || "wiki-active"
+			);
+
+			// Retain cross-note session memory from global history
+			const history = this.globalChatHistory.slice(-8);
+
+			const response = await chatWithVaultLLM(
+				{
+					userPrompt: promptText,
+					activeNotePath: activeFile?.path,
+					headerMapMarkdown: headerResult.headerMapMarkdown,
+					activeNoteSnippet: headerResult.activeNoteSnippet,
+					history,
+				},
+				this.plugin.settings,
+				(paths) => traverser.readSelectedNotes(paths, headerResult.nodes)
+			);
+
+			// Reconstruct full content for low-token patch edits
+			for (const change of response.proposedChanges) {
+				if (change.patch && change.action === "modify") {
+					const targetFile = this.app.vault.getAbstractFileByPath(change.targetPath);
+					if (targetFile instanceof TFile) {
+						const origText = await this.app.vault.read(targetFile);
+						change.proposedContent = applyProposedPatchToContent(
+							origText,
+							change.patch,
+							change.proposedContent
+						);
+					}
+				}
+
+				if (
+					change.action === "create" &&
+					!change.suggestedHubPath &&
+					headerResult.primaryTopicHubPath
+				) {
+					change.suggestedHubPath = headerResult.primaryTopicHubPath;
+				}
+			}
+
+			const assistantMsg: ChatMessage = {
+				id: `a-${Date.now()}`,
+				role: "assistant",
+				content: response.replyMarkdown,
+				timestamp: new Date().toLocaleTimeString([], {
+					hour: "2-digit",
+					minute: "2-digit",
+				}),
+				thoughtSteps: response.thoughtSteps,
+				stepPills: response.stepPills,
+				traversedNodes: headerResult.nodes,
+				primaryTopicHubPath: headerResult.primaryTopicHubPath,
+				proposedChanges: response.proposedChanges,
+			};
+
+			this.chatMessages.push(assistantMsg);
+			if (this.currentAnchorPath) {
+				this.chatHistoryByNote.set(this.currentAnchorPath, [...this.chatMessages]);
+			}
+
+			// Store in global history so conversational memory persists across note switches
+			this.globalChatHistory.push({ role: "user", content: promptText });
+			this.globalChatHistory.push({ role: "assistant", content: response.replyMarkdown });
+			if (this.globalChatHistory.length > 12) {
+				this.globalChatHistory = this.globalChatHistory.slice(-12);
+			}
+
+			this.isChatGenerating = false;
+			await this.renderView();
+
+			// If a new note or edit was proposed, pop up the approval modal
+			if (response.proposedChanges.length > 0) {
+				new NoteChangeApprovalModal(
+					this.app,
+					this.plugin,
+					response.proposedChanges[0],
+					() => {
+						void this.renderView();
+					}
+				).open();
+			}
+		} catch (err) {
+			this.isChatGenerating = false;
+			this.chatMessages.push({
+				id: `e-${Date.now()}`,
+				role: "assistant",
+				content: `⚠️ **Error**: ${String(err)}`,
+				timestamp: new Date().toLocaleTimeString([], {
+					hour: "2-digit",
+					minute: "2-digit",
+				}),
+			});
+			if (this.currentAnchorPath) {
+				this.chatHistoryByNote.set(this.currentAnchorPath, [...this.chatMessages]);
+			}
+			await this.renderView();
+		}
+	}
+
+	private renderChatMessage(
+		parent: HTMLElement,
+		msg: ChatMessage,
+		activeFile: TFile | null
+	): void {
+		const bubble = parent.createDiv({
+			cls: `lattice-chat-message lattice-chat-${msg.role}`,
+		});
+
+		if (msg.role === "assistant" && !msg.content.startsWith("⚠️")) {
+			// 1. Sleek, decluttered Traversal Trail (Wiki Context - excludes active note)
+			const connectedNodes = (msg.traversedNodes || []).filter(
+				(node) =>
+					node.provenance !== "anchor" &&
+					(!activeFile || node.path.toLowerCase() !== activeFile.path.toLowerCase())
+			);
+			if (connectedNodes.length > 0) {
+				const trailBox = bubble.createDiv({ cls: "lattice-trail-row" });
+				trailBox.createSpan({
+					cls: "lattice-trail-label",
+					text: "Context:",
+				});
+				for (const node of connectedNodes) {
+					const chip = trailBox.createSpan({
+						cls: `lattice-traversal-chip lattice-prov-${node.provenance}`,
+					});
+					const titleEl = chip.createSpan({
+						cls: "lattice-traversal-chip-title",
+						text: node.title,
+					});
+					titleEl.setAttr("title", `/${node.path}`);
+					titleEl.addEventListener("click", async () => {
+						const tf = this.app.vault.getAbstractFileByPath(node.path);
+						if (tf instanceof TFile) {
+							await this.app.workspace.getLeaf(false).openFile(tf);
+						}
+					});
+
+					if (node.provenance === "unlinked-bridge" && activeFile) {
+						const addBtn = chip.createSpan({
+							cls: "lattice-bridge-add-icon",
+							text: "+",
+						});
+						addBtn.setAttr("title", `Add link [[${node.title}]] to active note`);
+						addBtn.addEventListener("click", async (e) => {
+							e.stopPropagation();
+							const rec = this.plugin.indexer.getRecord(node.path) || {
+								path: node.path,
+								title: node.title,
+								mtime: Date.now(),
+								type: node.type,
+								description: node.description,
+								tags: node.tags,
+								vector: [],
+							};
+							await this.plugin.okf.crossLinkConcept(activeFile, rec);
+							node.provenance = "graph-1hop";
+							await this.renderView();
+						});
+					}
+				}
+			}
+
+			// 2. Compact collapsible Thought (<details>) only if there are thought steps
+			if (msg.thoughtSteps && msg.thoughtSteps.length > 0) {
+				const thoughtDetails = bubble.createEl("details", {
+					cls: "lattice-thought-drawer",
+				});
+				const summaryEl = thoughtDetails.createEl("summary", {
+					cls: "lattice-thought-summary",
+				});
+				summaryEl.setText(`Thought (${msg.thoughtSteps.length} steps)`);
+				const bulletsUl = thoughtDetails.createEl("ul", {
+					cls: "lattice-thought-bullets",
+				});
+				for (const step of msg.thoughtSteps) {
+					bulletsUl.createEl("li", {
+						text: step.replace(/^[•*-]\s*/, ""),
+					});
+				}
+			}
+		}
+
+		// 3. Message Body with Rich Markdown & Clickable Internal Links
+		const bodyEl = bubble.createDiv({ cls: "lattice-chat-reply" });
+		this.renderFormattedMarkdown(bodyEl, msg.content);
+
+		// 4. Proposed Note Change Card (Shown only when a new note/edit is proposed)
+		if (msg.proposedChanges && msg.proposedChanges.length > 0) {
+			const proposalsContainer = bubble.createDiv({
+				cls: "lattice-chat-proposals",
+			});
+			for (const change of msg.proposedChanges) {
+				const pCard = proposalsContainer.createDiv({
+					cls: "lattice-proposal-card",
+				});
+				const pHeader = pCard.createDiv({ cls: "lattice-proposal-header" });
+				pHeader.createSpan({
+					cls: "lattice-badge lattice-badge-topic",
+					text: change.action === "modify" ? "Proposed Edit" : "Proposed Note",
+				});
+				pHeader.createSpan({
+					cls: "lattice-proposal-path",
+					text: `/${change.targetPath}`,
+				});
+
+				if (change.summary) {
+					pCard.createDiv({
+						cls: "lattice-proposal-summary",
+						text: change.summary,
+					});
+				}
+
+				const reviewBtn = pCard.createEl("button", {
+					cls: "lattice-btn lattice-btn-primary",
+					text: change.applied ? "Review Again" : "Review Diff & Accept...",
+				});
+				reviewBtn.addEventListener("click", () => {
+					new NoteChangeApprovalModal(
+						this.app,
+						this.plugin,
+						change,
+						() => {
+							void this.renderView();
+						}
+					).open();
+				});
+			}
+		}
+
+		// 5. Clean, Minimal Timestamp Footer
+		const footer = bubble.createDiv({ cls: "lattice-chat-timestamp" });
+		footer.setText(msg.timestamp);
+	}
+
+	/**
+	 * Formats markdown text with headings, bullet/numbered lists, inline code, bold, italic,
+	 * and clickable bundle-relative `[Title](/path.md)` and `[[WikiLink]]` links.
+	 */
+	private renderFormattedMarkdown(container: HTMLElement, markdown: string): void {
+		const lines = markdown.split("\n");
+		let inList = false;
+		let currentListEl: HTMLElement | null = null;
+
+		for (let i = 0; i < lines.length; i++) {
+			const rawLine = lines[i];
+			const trimmed = rawLine.trim();
+
+			if (!trimmed) {
+				inList = false;
+				currentListEl = null;
+				continue;
+			}
+
+			// Headings
+			const headingMatch = trimmed.match(/^(#{1,4})\s+(.+)$/);
+			if (headingMatch) {
+				inList = false;
+				currentListEl = null;
+				const level = headingMatch[1].length;
+				const tag = `h${Math.min(level + 2, 6)}` as keyof HTMLElementTagNameMap;
+				const hEl = container.createEl(tag, { cls: "lattice-chat-heading" });
+				this.renderInlineSpans(hEl, headingMatch[2]);
+				continue;
+			}
+
+			// Bullet List (- or *)
+			const bulletMatch = trimmed.match(/^[-*]\s+(.+)$/);
+			if (bulletMatch) {
+				if (!inList || !currentListEl || currentListEl.tagName !== "UL") {
+					currentListEl = container.createEl("ul", {
+						cls: "lattice-chat-list",
+					});
+					inList = true;
+				}
+				const li = currentListEl.createEl("li");
+				this.renderInlineSpans(li, bulletMatch[1]);
+				continue;
+			}
+
+			// Numbered List (1. )
+			const numMatch = trimmed.match(/^\d+\.\s+(.+)$/);
+			if (numMatch) {
+				if (!inList || !currentListEl || currentListEl.tagName !== "OL") {
+					currentListEl = container.createEl("ol", {
+						cls: "lattice-chat-list",
+					});
+					inList = true;
+				}
+				const li = currentListEl.createEl("li");
+				this.renderInlineSpans(li, numMatch[1]);
+				continue;
+			}
+
+			// Regular Paragraph
+			inList = false;
+			currentListEl = null;
+			const pEl = container.createEl("p", { cls: "lattice-chat-paragraph" });
+			this.renderInlineSpans(pEl, trimmed);
+		}
+	}
+
+	private renderInlineSpans(container: HTMLElement, text: string): void {
+		const tokenRegex =
+			/(\[([^\]]+)\]\(([^)]+)\)|\[\[([^\]|#]+)(?:[|#]([^\]]+))?\]\]|`([^`]+)`|\*\*([^*]+)\*\*|\*([^*]+)\*)/g;
+		let lastIdx = 0;
+		let match: RegExpExecArray | null;
+
+		while ((match = tokenRegex.exec(text)) !== null) {
+			if (match.index > lastIdx) {
+				container.appendChild(
+					document.createTextNode(text.slice(lastIdx, match.index))
+				);
+			}
+
+			if (match[2] && match[3]) {
+				// [Title](/path.md)
+				const label = match[2];
+				const href = match[3].trim();
+				const linkSpan = container.createSpan({
+					cls: "lattice-chat-link",
+					text: label,
+				});
+				linkSpan.setAttr("title", href);
+				linkSpan.addEventListener("click", async () => {
+					const clean = href.replace(/^\/+/, "");
+					const tf = this.app.vault.getAbstractFileByPath(
+						clean.endsWith(".md") ? clean : `${clean}.md`
+					);
+					if (tf instanceof TFile) {
+						await this.app.workspace.getLeaf(false).openFile(tf);
+					}
+				});
+			} else if (match[4]) {
+				// [[WikiLink]]
+				const target = match[4].trim();
+				const label = match[5]?.trim() || target;
+				const linkSpan = container.createSpan({
+					cls: "lattice-chat-link",
+					text: label,
+				});
+				linkSpan.setAttr("title", target);
+				linkSpan.addEventListener("click", async () => {
+					const clean = target.replace(/^\/+/, "");
+					const tf =
+						this.app.vault.getAbstractFileByPath(
+							clean.endsWith(".md") ? clean : `${clean}.md`
+						) ||
+						this.app.vault
+							.getMarkdownFiles()
+							.find(
+								(f) => f.basename.toLowerCase() === clean.toLowerCase()
+							);
+					if (tf instanceof TFile) {
+						await this.app.workspace.getLeaf(false).openFile(tf);
+					}
+				});
+			} else if (match[6]) {
+				// Inline code `code`
+				container.createEl("code", {
+					cls: "lattice-chat-inline-code",
+					text: match[6],
+				});
+			} else if (match[7]) {
+				// Bold **text**
+				container.createEl("strong", {
+					text: match[7],
+				});
+			} else if (match[8]) {
+				// Italic *text*
+				container.createEl("em", {
+					text: match[8],
+				});
+			}
+
+			lastIdx = match.index + match[0].length;
+		}
+
+		if (lastIdx < text.length) {
+			container.appendChild(document.createTextNode(text.slice(lastIdx)));
 		}
 	}
 }

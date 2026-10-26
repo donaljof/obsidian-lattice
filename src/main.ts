@@ -30,8 +30,8 @@ export default class LatticePlugin extends Plugin {
 			(leaf: WorkspaceLeaf) => new LatticeSidebarView(leaf, this)
 		);
 
-		// Ribbon Icon to open the Ambient Discovery Sidebar
-		this.addRibbonIcon("network", "Lattice: Open Related Concepts", () => {
+		// Ribbon Icon to open Lattice Connect
+		this.addRibbonIcon("network", "Lattice: Open Connect", () => {
 			void this.activateSidebarView();
 		});
 
@@ -132,12 +132,21 @@ export default class LatticePlugin extends Plugin {
 			},
 		});
 
-		// 4. Open Ambient Related Concepts Sidebar
+		// 4. Open Lattice Connect Sidebar
 		this.addCommand({
 			id: "open-related-concepts-sidebar",
-			name: "Open Ambient Related Concepts Sidebar",
+			name: "Open Lattice Connect Sidebar",
 			callback: () => {
 				void this.activateSidebarView();
+			},
+		});
+
+		// 4b. Open Lattice Chat Sidebar
+		this.addCommand({
+			id: "open-vault-chat",
+			name: "Open Lattice Chat Sidebar",
+			callback: () => {
+				void this.activateSidebarView(false, true);
 			},
 		});
 
@@ -265,7 +274,10 @@ export default class LatticePlugin extends Plugin {
 		await this.okf.appendRelatedCallout(file, neighbors);
 	}
 
-	public async activateSidebarView(openVaultAudit = false): Promise<void> {
+	public async activateSidebarView(
+		openVaultAudit = false,
+		openChat = false
+	): Promise<void> {
 		const { workspace } = this.app;
 		let leaf: WorkspaceLeaf | null = null;
 		const leaves = workspace.getLeavesOfType(VIEW_TYPE_LATTICE);
@@ -284,8 +296,12 @@ export default class LatticePlugin extends Plugin {
 
 		if (leaf) {
 			await workspace.revealLeaf(leaf);
-			if (openVaultAudit && leaf.view instanceof LatticeSidebarView) {
-				leaf.view.openVaultConformancePanel();
+			if (leaf.view instanceof LatticeSidebarView) {
+				if (openChat) {
+					leaf.view.openChatPanel();
+				} else if (openVaultAudit) {
+					leaf.view.openVaultConformancePanel();
+				}
 			}
 		}
 	}
@@ -315,6 +331,10 @@ export default class LatticePlugin extends Plugin {
 		const raw = (await this.loadData()) as Partial<PersistedPluginData> | null;
 		if (raw && typeof raw === "object") {
 			this.settings = Object.assign({}, DEFAULT_SETTINGS, raw.settings || {});
+			// Upgrade legacy small default "llama3.2" to modern recommended model "qwen3:8b"
+			if (this.settings.chatModel === "llama3.2") {
+				this.settings.chatModel = DEFAULT_SETTINGS.chatModel;
+			}
 			if (raw.vectors && typeof raw.vectors === "object") {
 				return raw.vectors;
 			}
